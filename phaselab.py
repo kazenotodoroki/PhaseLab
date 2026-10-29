@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""PhaseLab - analyse de phase, de retard et de réponse pour prises micro.
+"""PhaseLab - phase, delay and response analysis for mic takes and speakers.
 
-Lancer :  python phaselab.py
+Run:  python phaselab.py
 """
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import json
 import math
 import re
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -21,142 +20,57 @@ from PySide6.QtCore import Qt
 
 import dsp
 from style import C, PALETTE, QSS
+from widgets import (break_wraps, busy, card, color_icon, dspin, fmt_hz, freq_plot, lin_plot, muted, nz,
+                     plot_area, readout, safe_name, section, short_hz)
+from tab_attack import AttackTab
+from tab_align import AlignTab
+from tab_rta import RtaTab
+from tab_eq import EqTab
+from tab_live import LiveTab
 
 APP = "PhaseLab"
-VERSION = "1.0"
+VERSION = "3.0"
 pg.setConfigOptions(antialias=True, background=C["plot_bg"], foreground=C["muted"],
                     imageAxisOrder="row-major")
 
-SMOOTHING = [("Aucun", 0), ("1/48 oct", 48), ("1/24 oct", 24), ("1/12 oct", 12),
+SMOOTHING = [("None", 0), ("1/48 oct", 48), ("1/24 oct", 24), ("1/12 oct", 12),
              ("1/6 oct", 6), ("1/3 oct", 3)]
-DELAY_MODES = [("Retard inclus", "none"), ("Retard de la référence retiré", "common"),
-               ("Retard propre retiré", "indiv")]
-TIME_MODES = [("Réponse impulsionnelle", "ir"), ("Enveloppe ETC (dB)", "etc"),
-              ("Prise vs original aligné", "aligned"),
-              ("Prise vs original × réponse (résidu = bruit + distorsion)", "model")]
+DELAY_MODES = [("Delay included", "none"), ("Reference delay removed", "common"),
+               ("Own delay removed", "indiv")]
+TIME_MODES = [("Impulse response", "ir"), ("ETC envelope (dB)", "etc"),
+              ("Take vs aligned original / loopback", "aligned"),
+              ("Take vs original × response (residual = noise + distortion)", "model")]
 FREQ_COLORS = ["#4fc3f7", "#aed581", "#ffd54f", "#ff8a65", "#f06292", "#ba68c8", "#4db6ac", "#e0e0e0"]
-
-
-# ----------------------------------------------------------------- utilitaires
-def fmt_hz(f):
-    return f"{f:.1f} Hz" if f < 1000 else f"{f / 1000:.3f} kHz"
-
-
-def nz(v, eps=0.05):
-    """Évite l'affichage de « -0.0 »."""
-    return 0.0 if abs(v) < eps else v
-
-
-def short_hz(f):
-    return f"{f / 1000:g}k" if f >= 1000 else f"{f:g}"
-
-
-def safe_name(s):
-    return re.sub(r"[^\w\-. ]+", "_", s).strip() or "mesure"
-
-
-def break_wraps(y, limit=180.0):
-    """Insère des NaN aux sauts de phase pour ne pas tracer de traits verticaux."""
-    y = np.array(y, dtype=float)
-    jumps = np.where(np.abs(np.diff(y)) > limit)[0]
-    y[jumps + 1] = np.nan
-    return y
-
-
-def color_icon(color, size=10):
-    pm = QtGui.QPixmap(size, size)
-    pm.fill(QtGui.QColor(color))
-    return QtGui.QIcon(pm)
-
-
-@contextmanager
-def busy():
-    QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
-    QtWidgets.QApplication.processEvents()
-    try:
-        yield
-    finally:
-        QtWidgets.QApplication.restoreOverrideCursor()
-
-
-class FreqAxis(pg.AxisItem):
-    """Axe fréquentiel log avec graduations lisibles (20, 50, 100, 1k…)."""
-    MAJ = [10, 20, 50, 100, 200, 500, 1e3, 2e3, 5e3, 1e4, 2e4, 5e4]
-    MIN = [k * d for d in (10, 100, 1000, 10000) for k in range(1, 10)]
-
-    def tickValues(self, minVal, maxVal, size):
-        if not self.logMode:
-            return super().tickValues(minVal, maxVal, size)
-        maj = [math.log10(v) for v in self.MAJ if minVal <= math.log10(v) <= maxVal]
-        mi = [math.log10(v) for v in self.MIN if v not in self.MAJ and minVal <= math.log10(v) <= maxVal]
-        if len(maj) < 2:
-            lo, hi = 10 ** minVal, 10 ** maxVal
-            maj = [math.log10(v) for v in np.geomspace(lo, hi, 5)]
-        return [(1.0, maj), (0.5, mi)]
-
-    def tickStrings(self, values, scale, spacing):
-        if not self.logMode:
-            return super().tickStrings(values, scale, spacing)
-        out = []
-        for v in values:
-            f = 10 ** v
-            out.append(short_hz(float(f"{f:.3g}")) if spacing == 1.0 else "")
-        return out
-
-
-def style_plot(p, ylabel, xlabel=None):
-    p.showGrid(x=True, y=True, alpha=0.10)
-    p.hideButtons()
-    p.setMenuEnabled(False)
-    for ax in ("left", "bottom"):
-        a = p.getAxis(ax)
-        a.setPen(pg.mkPen(C["border"]))
-        a.setTextPen(pg.mkPen(C["muted"]))
-    p.getAxis("left").setWidth(58)
-    p.setLabel("left", ylabel, color=C["muted"], **{"font-size": "9pt"})
-    if xlabel:
-        p.setLabel("bottom", xlabel, color=C["muted"], **{"font-size": "9pt"})
-    return p
-
-
-def freq_plot(ylabel):
-    p = pg.PlotItem(axisItems={"bottom": FreqAxis("bottom")})
-    p.setLogMode(x=True, y=False)
-    return style_plot(p, ylabel)
-
-
-def lin_plot(ylabel, xlabel=None):
-    return style_plot(pg.PlotItem(), ylabel, xlabel)
-
-
-def section(text):
-    lab = QtWidgets.QLabel(text.upper())
-    lab.setObjectName("Section")
-    return lab
-
-
-def muted(text, wrap=False):
-    lab = QtWidgets.QLabel(text)
-    lab.setObjectName("Muted")
-    lab.setWordWrap(wrap)
-    return lab
+TABS = [("live", "Real time"), ("resp", "Response"), ("time", "Time"), ("attack", "Onset"), ("diff", "Differences"),
+        ("align", "Alignment"), ("rot", "Rotation"), ("rta", "Spectrum"), ("eq", "EQ && target")]
+MEASURE_TABS = {"resp", "time", "diff", "rot"}
+NFFTS = [8192, 16384, 32768, 65536, 131072]
 
 
 # ---------------------------------------------------------------- dialogues
 class GenerateDialog(QtWidgets.QDialog):
     HINTS = {
-        "sweep": "Méthode de référence (Farina / Novak). Rejette la distorsion harmonique, "
-                 "meilleur rapport signal/bruit. Plus long = plus de précision.",
-        "pink": "Bruit rose à bande limitée. Utile pour vérifier une mesure, moins précis "
-                "que le sweep pour la phase.",
-        "white": "Bruit blanc à bande limitée. Énergie égale par Hz (beaucoup d'aigus).",
-        "impulse": "Impulsion unique (Dirac). Peu d'énergie : à réserver aux tests de chaîne.",
+        "sweep": "Reference method (Farina / Novak). Rejects harmonic distortion, best signal-to-noise "
+                 "ratio. Longer = more accurate.",
+        "sweep_rep": "Back-to-back sweeps: the 1st period is ignored, the following ones are averaged "
+                     "(3 dB more signal-to-noise each time the count doubles) and coherence is computed.",
+        "pink": "Pink noise (−3 dB/oct), equal energy per octave. Analysed as dual channel, as in "
+                "Open Sound Meter: transfer function + coherence.",
+        "white": "White noise, equal energy per Hz (lots of treble: careful with tweeters).",
+        "brown": "Brown noise (−6 dB/oct), mostly low end: useful for subs.",
+        "pink_per": "Periodic pink noise: exact spectrum, no random fluctuation. Synchronous averaging: "
+                    "the method of pro measurement systems for a stable reading in little time.",
+        "white_per": "Periodic white noise (exactly flat spectrum), synchronous averaging.",
+        "mls": "Maximum length sequence (MLS): the historical method (MLSSA). Sensitive to "
+               "distortion; prefer the sweep or periodic noise.",
+        "sine": "Pure sine: level calibration, polarity check, distortion (Spectrum tab).",
+        "impulse": "Single impulse (Dirac). Little energy: only for digital chain tests.",
     }
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Générer un signal de test")
-        self.setMinimumWidth(420)
+        self.setWindowTitle("Generate a test signal")
+        self.setMinimumWidth(460)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(18, 18, 18, 18)
         lay.setSpacing(12)
@@ -164,7 +78,7 @@ class GenerateDialog(QtWidgets.QDialog):
         form.setLabelAlignment(Qt.AlignRight)
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(8)
-
+        self.form = form
         self.kind = QtWidgets.QComboBox()
         for k, v in dsp.KIND_LABELS.items():
             self.kind.addItem(v, k)
@@ -175,53 +89,76 @@ class GenerateDialog(QtWidgets.QDialog):
         self.subtype = QtWidgets.QComboBox()
         for k, v in dsp.SUBTYPES.items():
             self.subtype.addItem(v, k)
-
-        def dspin(lo, hi, val, dec, suffix, step=1.0):
-            s = QtWidgets.QDoubleSpinBox()
-            s.setRange(lo, hi); s.setDecimals(dec); s.setValue(val)
-            s.setSuffix(suffix); s.setSingleStep(step)
-            return s
-
-        self.duration = dspin(0.5, 120, 5, 1, " s", 0.5)
+        self.duration = dspin(0.5, 600, 5, 1, " s", step=0.5)
         self.f1 = dspin(1, 2000, 20, 1, " Hz")
-        self.f2 = dspin(100, 96000, 20000, 0, " Hz", 100)
-        self.level = dspin(-60, 0, -6, 1, " dBFS", 0.5)
-        self.pre = dspin(0, 10, 0.5, 2, " s", 0.1)
-        self.post = dspin(0, 20, 2, 2, " s", 0.5)
-        form.addRow("Type", self.kind)
-        form.addRow("Échantillonnage", self.fs)
-        form.addRow("Format", self.subtype)
-        form.addRow("Durée", self.duration)
-        form.addRow("Fréquence début", self.f1)
-        form.addRow("Fréquence fin", self.f2)
-        form.addRow("Niveau crête", self.level)
-        form.addRow("Silence avant", self.pre)
-        form.addRow("Silence après", self.post)
+        self.f2 = dspin(100, 96000, 20000, 0, " Hz", step=100)
+        self.sine = dspin(1, 40000, 1000, 1, " Hz")
+        self.period = QtWidgets.QComboBox()
+        for n in range(14, 20):
+            self.period.addItem(f"2^{n} samples", n)
+        self.period.setCurrentIndex(3)
+        self.repeats = QtWidgets.QSpinBox()
+        self.repeats.setRange(2, 256)
+        self.repeats.setValue(8)
+        self.level = dspin(-60, 0, -6, 1, " dBFS", step=0.5)
+        self.pre = dspin(0, 10, 0.5, 2, " s", step=0.1)
+        self.post = dspin(0, 20, 2, 2, " s", step=0.5)
+        self.rows = {}
+        for lab, w in (("Type", self.kind), ("Sample rate", self.fs), ("Format", self.subtype),
+                       ("Duration", self.duration), ("Frequency", self.sine), ("Start frequency", self.f1),
+                       ("End frequency", self.f2), ("Period", self.period), ("Repeats", self.repeats),
+                       ("Peak level", self.level), ("Silence before", self.pre), ("Silence after", self.post)):
+            form.addRow(lab, w)
+            self.rows[lab] = w
         lay.addLayout(form)
         self.hint = muted("", wrap=True)
         lay.addWidget(self.hint)
-        tip = muted("Le silence après doit couvrir la décroissance de la pièce. "
-                    "Utilise la même fréquence d'échantillonnage que ton projet Reaper.", wrap=True)
-        lay.addWidget(tip)
+        self.calc = muted("", wrap=True)
+        lay.addWidget(self.calc)
+        lay.addWidget(muted("Use the same sample rate as your Reaper project. The silence after "
+                            "must cover the room's decay.", wrap=True))
         btns = QtWidgets.QHBoxLayout()
         btns.addStretch()
-        cancel = QtWidgets.QPushButton("Annuler")
-        ok = QtWidgets.QPushButton("Générer et enregistrer…")
+        cancel = QtWidgets.QPushButton("Cancel")
+        ok = QtWidgets.QPushButton("Generate and save…")
         ok.setObjectName("Primary")
         cancel.clicked.connect(self.reject)
         ok.clicked.connect(self.accept)
         btns.addWidget(cancel)
         btns.addWidget(ok)
         lay.addLayout(btns)
-        self.kind.currentIndexChanged.connect(self._kind_changed)
+        for w in (self.kind, self.fs, self.period):
+            w.currentIndexChanged.connect(self._kind_changed)
+        self.repeats.valueChanged.connect(self._kind_changed)
         self._kind_changed()
 
-    def _kind_changed(self):
+    def _show(self, lab, on):
+        w = self.rows[lab]
+        w.setVisible(on)
+        lb = self.form.labelForField(w)
+        if lb:
+            lb.setVisible(on)
+
+    def _kind_changed(self, *_):
         k = self.kind.currentData()
+        per = k in dsp.PERIODIC_KINDS
         self.hint.setText(self.HINTS[k])
-        self.duration.setEnabled(k != "impulse")
-        self.f1.setEnabled(k != "impulse")
-        self.f2.setEnabled(k != "impulse")
+        self._show("Duration", not per and k != "impulse")
+        self._show("Frequency", k == "sine")
+        self._show("Start frequency", k not in ("impulse", "sine", "mls"))
+        self._show("End frequency", k not in ("impulse", "sine", "mls"))
+        self._show("Period", per)
+        self._show("Repeats", per)
+        if per:
+            n = self.period.currentData()
+            P = (2 ** n - 1) if k == "mls" else 2 ** n
+            fs = self.fs.currentData()
+            self.calc.setText(f"Period {P / fs:.2f} s (response up to {P / fs * 1000:.0f} ms, resolution "
+                              f"{fs / P:.2f} Hz) · total duration {P * self.repeats.value() / fs:.1f} s · "
+                              f"{self.repeats.value() - 1} periods averaged")
+        else:
+            self.calc.setText("")
+        self.adjustSize()
 
     def spec(self):
         k = self.kind.currentData()
@@ -231,7 +168,53 @@ class GenerateDialog(QtWidgets.QDialog):
             f1=self.f1.value() if k != "impulse" else 10.0,
             f2=self.f2.value() if k != "impulse" else 0.45 * fs,
             level_db=self.level.value(), pre_silence=self.pre.value(),
-            post_silence=self.post.value(), subtype=self.subtype.currentData())
+            post_silence=self.post.value(), subtype=self.subtype.currentData(),
+            period_pow=self.period.currentData(), repeats=self.repeats.value(), sine_freq=self.sine.value())
+
+
+class CombineDialog(QtWidgets.QDialog):
+    def __init__(self, meas, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Combine measurements")
+        self.setMinimumWidth(420)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(10)
+        self.op = QtWidgets.QComboBox()
+        for k, v in dsp.COMBINE_OPS.items():
+            self.op.addItem(v, k)
+        lay.addWidget(muted("Operation"))
+        lay.addWidget(self.op)
+        lay.addWidget(muted("Measurements (in order: A, B, …)"))
+        self.list = QtWidgets.QListWidget()
+        for m in meas:
+            it = QtWidgets.QListWidgetItem(color_icon(m.color), m.name)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if m.visible else Qt.Unchecked)
+            self.list.addItem(it)
+        lay.addWidget(self.list)
+        self.name = QtWidgets.QLineEdit("Average")
+        lay.addWidget(muted("Name"))
+        lay.addWidget(self.name)
+        lay.addWidget(muted("Power average: average level of several mic positions (the classic basis "
+                            "for a room EQ). Sum: what two speakers or two mics give together, "
+                            "delays and polarities included.", wrap=True))
+        self.op.currentIndexChanged.connect(
+            lambda: self.name.setText({"vector": "Average", "power": "Power average", "sum": "Sum",
+                                       "diff": "Difference"}[self.op.currentData()]))
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch()
+        c = QtWidgets.QPushButton("Cancel")
+        c.clicked.connect(self.reject)
+        ok = QtWidgets.QPushButton("Create")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self.accept)
+        btns.addWidget(c)
+        btns.addWidget(ok)
+        lay.addLayout(btns)
+
+    def chosen(self):
+        return [i for i in range(self.list.count()) if self.list.item(i).checkState() == Qt.Checked]
 
 
 GUIDE_HTML = f"""
@@ -241,42 +224,63 @@ p, li {{ color: {C['text']}; line-height: 145%; }}
 .m {{ color: {C['muted']}; }}
 b {{ color: {C['accent']}; font-weight: 600; }}
 </style>
-<h3>1 · Générer</h3>
-<p>Bouton <b>Générer…</b> : choisis le type (le sweep est recommandé), la fréquence
-d'échantillonnage de ton projet Reaper, puis enregistre le WAV. Un petit fichier
-<span class="m">.phaselab.json</span> est créé à côté : il décrit exactement le signal.
-Garde-les ensemble.</p>
+<h3>Real time</h3>
+<p><b>Real time</b> tab: choose your audio interface, the mic input (A, and B for a 2nd mic),
+the reference (<b>loopback</b> recommended, otherwise the internal generator) and the generator output
+(pink noise recommended, <b>start at a low level</b>). <b>Start</b>: spectrum, transfer function,
+phase, coherence and impulse response are shown live; the delay is found automatically
+after 2 s (<b>Find delay</b> to run it again, <b>Auto tracking</b> if you move the mic).
+<b>Store A / B</b> adds the measurement to the takes list: Alignment, EQ, Differences… work on it.
+Close Reaper (or free the interface) if it uses it in exclusive mode. <b>Simulation</b> mode lets you
+try everything without hardware.</p>
+<p class="m">Continuous sweeps are available in real time: the frequency response builds up with long
+averaging, but they are <b>not effective for time-domain measurement</b> (delay, impulse response,
+phase). Use pink noise for those.</p>
 
-<h3>2 · Enregistrer dans Reaper</h3>
+<h3>1 · Generate</h3>
+<p><b>Generate…</b> button: sweep (most accurate), repeated sweeps, white / pink / brown noise,
+periodic noises, MLS, sine. Choose your Reaper project's sample rate.
+A small <span class="m">.phaselab.json</span> file is created next to the WAV: keep them together.</p>
+
+<h3>2 · Record in Reaper</h3>
 <ol>
-<li>Projet à la <b>même fréquence d'échantillonnage</b> que le signal.</li>
-<li>Glisse le WAV du signal sur une piste, <b>au tout début du projet (0:00)</b>,
-routée vers l'enceinte. Aucun effet sur cette piste.</li>
-<li>Une piste par micro, armée, entrée = le micro, <b>sans effet en entrée</b>.</li>
-<li>Démarre l'enregistrement depuis 0:00 et laisse tourner jusqu'à la fin du fichier.</li>
-<li>Rotation : une prise par angle, en ne changeant <b>que l'angle</b>
-(même gain, même position). Nomme les prises avec l'angle :
-<span class="m">snare_45deg</span>, <span class="m">snare_90deg</span>… l'angle est lu automatiquement.</li>
-<li>Exporte : <span class="m">File › Render</span>, source <b>Stems (selected tracks)</b>,
-bornes <b>Entire project</b>, même fréquence, sans normalisation ni dither.
-Le rendu depuis 0:00 garantit un alignement exact sur le signal.</li>
+<li>Project at the <b>same sample rate</b> as the signal.</li>
+<li>Drag the signal WAV onto a track, <b>at the very start of the project (0:00)</b>, routed to the speaker.</li>
+<li>One track per mic, armed, <b>no input FX</b>. Record from 0:00 to the end of the file.</li>
+<li>Name the takes with the angle (<span class="m">snare_45deg</span>…): it is read automatically.</li>
+<li>Export: <span class="m">File › Render</span>, <b>Stems (selected tracks)</b>, bounds <b>Entire project</b>,
+no normalization or dither.</li>
 </ol>
 
-<h3>Option pro : loopback</h3>
-<p>Relie une sortie de l'interface à une entrée et enregistre-la en même temps que
-les micros, dans un rendu multicanal (<span class="m">Render › Multichannel</span>).
-Indique ensuite son numéro dans <b>Canal loopback</b>. Chaque prise est alors
-mesurée par rapport à ce qui est réellement sorti de l'interface (méthode à
-double canal) : latence et coloration de l'interface disparaissent.</p>
+<h3>Loopback (dual channel, like Open Sound Meter)</h3>
+<p>Connect an interface output to an input and record it together with the mics
+(<span class="m">Render › Multichannel</span>). Enter its number in <b>Loopback</b>.
+Each take is then measured against what actually left the interface: interface latency and coloration
+disappear. With a loopback, <b>any signal works</b>, even music, and the test signal becomes optional.
+Coherence (Response tab) shows how reliable each frequency is.</p>
 
-<h3>3 · Lire les résultats</h3>
-<p><b>Réponse</b> : niveau, phase et retard de groupe de chaque prise.
-<b>Temps</b> : réponse impulsionnelle, enveloppe, et comparaison directe avec l'original.
-<b>Différences</b> : écart de niveau et de phase par rapport à la référence, sommation
-avant/après correction, et le tableau des <b>réglages</b> (retard, polarité, rotation
-de phase, gain) à appliquer pour aligner chaque prise.
-<b>Rotation</b> : évolution de la phase, du niveau et du retard selon l'angle du micro.</p>
-<p class="m">Astuce : survole un graphique pour lire les valeurs exactes à une fréquence.</p>
+<h3>3 · Read the results</h3>
+<p><b>Response</b>: level, phase, group delay, coherence.
+<b>Time</b>: impulse response, envelope, comparison with the original or the loopback.
+<b>Onset</b>: zoom down to the sample, wave reconstructed between samples, first motion
+and polarity of each take.
+<b>Differences</b>: level and phase deviations, summation, settings table.
+<b>Alignment</b>: instant offset between two speakers (peak, onset or phase at crossover) and a button
+to apply it. Two speakers playing together: tick "Multiple arrivals".
+<b>Rotation</b>: phase, level and time versus mic angle.</p>
+
+<h3>Mixes, targets and EQ</h3>
+<p><b>Spectrum</b>: drag in your mixes and references (any audio file): average spectrum,
+spectrogram, LUFS loudness, true peak. <b>Create a target</b> from a reference or from the average
+of several: it is kept for all your projects.
+<b>EQ & target</b>: put a parametric EQ on any curve (measurement or mix). Double-click to
+add a band, drag for frequency and gain, mouse wheel for Q, or <b>Auto-EQ</b> to the target.
+Export to ReaEQ (settings) or ReaVerb (WAV of the exact EQ).</p>
+
+<h3>Adjustments</h3>
+<p>Below the takes list: delay, gain and polarity of the selected take. Every tab takes them into
+account, so you can simulate an alignment before doing it for real.</p>
+<p class="m">Tip: hover over a plot to read exact values.</p>
 """
 
 
@@ -284,14 +288,13 @@ class GuideDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Guide")
-        self.resize(620, 640)
+        self.resize(660, 720)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(18, 12, 18, 18)
         tb = QtWidgets.QTextBrowser()
         tb.setHtml(GUIDE_HTML)
-        tb.setOpenExternalLinks(True)
         lay.addWidget(tb)
-        close = QtWidgets.QPushButton("Fermer")
+        close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.accept)
         row = QtWidgets.QHBoxLayout()
         row.addStretch()
@@ -299,24 +302,27 @@ class GuideDialog(QtWidgets.QDialog):
         lay.addLayout(row)
 
 
-# ------------------------------------------------------------ fenêtre principale
+# ------------------------------------------------------------ main window
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP)
-        self.resize(1440, 880)
+        self.resize(1480, 900)
         self.setAcceptDrops(True)
 
         self.signal: dsp.TestSignal | None = None
         self.meas: list[dsp.Measurement] = []
-        self.ref: dsp.Measurement | None = None     # None = signal original
+        self.audio_files = []
+        self.ref: dsp.Measurement | None = None     # None = original signal
         self.sel: dsp.Measurement | None = None
         self.project_path = None
         self._spec_cache = {}
         self._orig_cache = {}
         self._updating = False
-        self.A = None   # résultats d'analyse
+        self._force_tabs = False
+        self.A = None   # analysis results
         self._color_i = 0
+        self._dirty = {k for k, _ in TABS}
 
         self._timer = QtCore.QTimer(self)
         self._timer.setSingleShot(True)
@@ -326,6 +332,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._build_menu()
         self._update_signal_card()
+        self._update_adjust_card()
+        self._rebuild_ref_combo()
         self._update_welcome()
 
     # ------------------------------------------------------------- interface
@@ -344,10 +352,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_welcome())
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self._build_resp_tab(), "Réponse")
-        self.tabs.addTab(self._build_time_tab(), "Temps")
-        self.tabs.addTab(self._build_diff_tab(), "Différences")
-        self.tabs.addTab(self._build_rot_tab(), "Rotation")
+        self.attack_tab = AttackTab(self)
+        self.align_tab = AlignTab(self)
+        self.rta_tab = RtaTab(self)
+        self.eq_tab = EqTab(self)
+        self.live_tab = LiveTab(self)
+        widgets = dict(live=self.live_tab, resp=self._build_resp_tab(), time=self._build_time_tab(), attack=self.attack_tab,
+                       diff=self._build_diff_tab(), align=self.align_tab, rot=self._build_rot_tab(),
+                       rta=self.rta_tab, eq=self.eq_tab)
+        for k, lab in TABS:
+            self.tabs.addTab(widgets[k], lab)
+        self.tabs.currentChanged.connect(self._draw_current)
         self.stack.addWidget(self.tabs)
         v.addWidget(self.stack, 1)
         h.addWidget(right, 1)
@@ -355,7 +370,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         sb = self.statusBar()
         sb.setSizeGripEnabled(False)
-        self.status_msg = QtWidgets.QLabel("Prêt")
+        self.status_msg = QtWidgets.QLabel("Ready")
         self.cursor_lab = QtWidgets.QLabel("")
         self.cursor_lab.setObjectName("Value")
         sb.addWidget(self.status_msg, 1)
@@ -366,8 +381,8 @@ class MainWindow(QtWidgets.QMainWindow):
         side.setObjectName("Sidebar")
         side.setFixedWidth(310)
         v = QtWidgets.QVBoxLayout(side)
-        v.setContentsMargins(16, 16, 16, 14)
-        v.setSpacing(10)
+        v.setContentsMargins(16, 14, 16, 12)
+        v.setSpacing(8)
 
         top = QtWidgets.QHBoxLayout()
         t = QtWidgets.QLabel(APP)
@@ -379,34 +394,32 @@ class MainWindow(QtWidgets.QMainWindow):
         help_btn.clicked.connect(self.show_guide)
         top.addWidget(help_btn)
         v.addLayout(top)
-        v.addSpacing(6)
 
-        v.addWidget(section("Signal de test"))
-        card = QtWidgets.QFrame()
-        card.setObjectName("Card")
-        cv = QtWidgets.QVBoxLayout(card)
+        v.addWidget(section("Test signal"))
+        cd = card()
+        cv = QtWidgets.QVBoxLayout(cd)
         cv.setContentsMargins(10, 8, 10, 8)
         cv.setSpacing(2)
-        self.sig_name = QtWidgets.QLabel("Aucun signal")
+        self.sig_name = QtWidgets.QLabel("No signal")
         self.sig_info = muted("", wrap=True)
         cv.addWidget(self.sig_name)
         cv.addWidget(self.sig_info)
-        v.addWidget(card)
+        v.addWidget(cd)
         row = QtWidgets.QHBoxLayout()
-        self.btn_gen = QtWidgets.QPushButton("Générer…")
-        self.btn_gen.setToolTip("Crée un sweep ou un bruit à jouer dans Reaper")
+        self.btn_gen = QtWidgets.QPushButton("Generate…")
+        self.btn_gen.setToolTip("Sweep, noises, periodic signals, MLS, sine to play in Reaper")
         self.btn_gen.clicked.connect(self.generate_signal)
-        self.btn_load_sig = QtWidgets.QPushButton("Charger…")
-        self.btn_load_sig.setToolTip("Charge un signal déjà généré (WAV)")
+        self.btn_load_sig = QtWidgets.QPushButton("Load…")
+        self.btn_load_sig.setToolTip("Loads a previously generated signal (WAV)")
         self.btn_load_sig.clicked.connect(self.load_signal_dialog)
         row.addWidget(self.btn_gen)
         row.addWidget(self.btn_load_sig)
         v.addLayout(row)
 
-        v.addSpacing(8)
-        v.addWidget(section("Prises"))
+        v.addSpacing(4)
+        v.addWidget(section("Takes"))
         self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["", "Nom", "Angle", "Pic ms", "SNR"])
+        self.table.setHorizontalHeaderLabels(["", "Name", "Angle", "Peak ms", "SNR"])
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Fixed)
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
@@ -422,32 +435,79 @@ class MainWindow(QtWidgets.QMainWindow):
                                    | QtWidgets.QAbstractItemView.EditKeyPressed)
         self.table.itemChanged.connect(self._table_item_changed)
         self.table.itemSelectionChanged.connect(self._table_selection)
-        self.table.setToolTip("Coche pour afficher · double-clic pour renommer ou saisir l'angle")
+        self.table.setToolTip("Tick to show · double-click to rename or enter the angle")
         v.addWidget(self.table, 1)
 
         row = QtWidgets.QHBoxLayout()
-        self.btn_import = QtWidgets.QPushButton("Importer des prises…")
+        self.btn_import = QtWidgets.QPushButton("Import…")
         self.btn_import.clicked.connect(self.import_dialog)
-        self.btn_remove = QtWidgets.QPushButton("Retirer")
+        b = QtWidgets.QPushButton("Combine…")
+        b.setToolTip("Average (vector or power), sum or difference of measurements")
+        b.clicked.connect(self.combine_dialog)
+        self.btn_remove = QtWidgets.QPushButton("Remove")
         self.btn_remove.clicked.connect(self.remove_selected)
         row.addWidget(self.btn_import, 1)
+        row.addWidget(b)
         row.addWidget(self.btn_remove)
         v.addLayout(row)
 
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(muted("Canal loopback"))
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
         self.loop_combo = QtWidgets.QComboBox()
-        self.loop_combo.addItem("Aucun", 0)
+        self.loop_combo.addItem("None", 0)
         for i in range(1, 17):
             self.loop_combo.addItem(f"Canal {i}", i)
         self.loop_combo.setToolTip(
-            "Si tes fichiers multicanaux contiennent un retour direct de la sortie de "
-            "l'interface, indique son canal : il sert alors de référence temporelle.")
+            "Channel carrying the direct return of the interface output (dual-channel reference). "
+            "With a loopback, any signal (noise, music) can be measured.")
         self.loop_combo.currentIndexChanged.connect(self._loop_changed)
-        row.addStretch()
-        row.addWidget(self.loop_combo)
-        v.addLayout(row)
-        v.addWidget(muted("Glisse des WAV n'importe où dans la fenêtre.", wrap=True))
+        self.method_combo = QtWidgets.QComboBox()
+        for k in ("auto", "sweep", "periodic", "dual"):
+            self.method_combo.addItem(dsp.METHOD_LABELS[k], k)
+        self.method_combo.setToolTip(
+            "Automatic: sweep → deconvolution, periodic signal → synchronous averaging, "
+            "noise or music → dual channel.")
+        self.method_combo.currentIndexChanged.connect(self._loop_changed)
+        self.nfft_combo = QtWidgets.QComboBox()
+        for n in NFFTS:
+            self.nfft_combo.addItem(f"{n // 1024}k", n)
+        self.nfft_combo.setCurrentIndex(2)
+        self.nfft_combo.setToolTip("Dual-channel FFT size: larger = better low-end resolution, "
+                                   "fewer averages")
+        self.nfft_combo.currentIndexChanged.connect(self._loop_changed)
+        grid.addWidget(muted("Loopback"), 0, 0)
+        grid.addWidget(self.loop_combo, 0, 1, 1, 2)
+        grid.addWidget(muted("Method"), 1, 0)
+        grid.addWidget(self.method_combo, 1, 1)
+        grid.addWidget(self.nfft_combo, 1, 2)
+        grid.setColumnStretch(1, 1)
+        v.addLayout(grid)
+
+        v.addSpacing(4)
+        v.addWidget(section("Take adjustments"))
+        cd = card()
+        g = QtWidgets.QGridLayout(cd)
+        g.setContentsMargins(10, 8, 10, 8)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        self.adj_delay = dspin(-1000, 1000, 0, 3, " ms", step=0.01, slot=self._adjust_edited,
+                               tip="Delay added to the take (positive = later)")
+        self.adj_gain = dspin(-40, 40, 0, 2, " dB", step=0.5, slot=self._adjust_edited)
+        self.adj_inv = QtWidgets.QCheckBox("Polarity inverted")
+        self.adj_inv.toggled.connect(self._adjust_edited)
+        self.adj_reset = QtWidgets.QPushButton("Reset")
+        self.adj_reset.setObjectName("Flat")
+        self.adj_reset.clicked.connect(self._adjust_reset)
+        g.addWidget(muted("Delay"), 0, 0)
+        g.addWidget(self.adj_delay, 0, 1)
+        g.addWidget(muted("Gain"), 1, 0)
+        g.addWidget(self.adj_gain, 1, 1)
+        g.addWidget(self.adj_inv, 2, 0, 1, 2)
+        g.addWidget(self.adj_reset, 2, 1, Qt.AlignRight)
+        g.setColumnStretch(1, 1)
+        v.addWidget(cd)
+        self.adj_card = cd
         return side
 
     def _labeled(self, lay, text, w):
@@ -464,20 +524,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.ref_combo = QtWidgets.QComboBox()
         self.ref_combo.setMinimumWidth(170)
-        self.ref_combo.setToolTip("Toutes les différences sont calculées par rapport à cette référence")
+        self.ref_combo.setToolTip("All differences are computed against this reference")
         self.ref_combo.currentIndexChanged.connect(self._ref_changed)
-        self._labeled(h, "Référence", self.ref_combo)
+        self._labeled(h, "Reference", self.ref_combo)
 
         self.smooth_combo = QtWidgets.QComboBox()
         for lab, v in SMOOTHING:
             self.smooth_combo.addItem(lab, v)
         self.smooth_combo.setCurrentIndex(3)
-        self.smooth_combo.setToolTip("Lissage complexe par fraction d'octave (préserve la phase)")
+        self.smooth_combo.setToolTip("Fractional-octave smoothing (complex for measurements: preserves phase)")
         self.smooth_combo.currentIndexChanged.connect(self.schedule)
-        self._labeled(h, "Lissage", self.smooth_combo)
+        self._labeled(h, "Smoothing", self.smooth_combo)
 
         self.wrap_combo = QtWidgets.QComboBox()
-        self.wrap_combo.addItems(["Enroulée ±180°", "Déroulée"])
+        self.wrap_combo.addItems(["Wrapped ±180°", "Unwrapped"])
         self.wrap_combo.currentIndexChanged.connect(self.schedule)
         self._labeled(h, "Phase", self.wrap_combo)
 
@@ -486,41 +546,33 @@ class MainWindow(QtWidgets.QMainWindow):
             self.delay_combo.addItem(lab, v)
         self.delay_combo.setCurrentIndex(1)
         self.delay_combo.setToolTip(
-            "Inclus : phase brute (le retard fait tourner la phase très vite).\n"
-            "Référence retirée : on garde les écarts de temps entre prises.\n"
-            "Propre retiré : chaque prise est recentrée, on ne voit que la forme de phase.")
+            "Included: raw phase (the delay makes the phase spin very fast).\n"
+            "Reference removed: time offsets between takes are kept.\n"
+            "Own removed: each take is re-centered, only the phase shape is shown.")
         self.delay_combo.currentIndexChanged.connect(self.schedule)
-        self._labeled(h, "Affichage", self.delay_combo)
+        self._labeled(h, "Display", self.delay_combo)
 
-        def spin(lo, hi, val, tip):
-            s = QtWidgets.QDoubleSpinBox()
-            s.setRange(lo, hi); s.setValue(val); s.setDecimals(1)
-            s.setSuffix(" ms"); s.setFixedWidth(84)
-            s.setKeyboardTracking(False)
-            s.setToolTip(tip)
-            s.valueChanged.connect(self.schedule)
-            return s
-
-        self.pre_spin = spin(0.2, 200, 5, "Durée gardée avant le pic de la réponse impulsionnelle")
-        self.post_spin = spin(1, 3000, 100,
-                              "Durée gardée après le pic. Plus court = ignore les réflexions, "
-                              "mais résolution basse fréquence ≈ 1000 / durée Hz")
-        h.addWidget(muted("Fenêtre"))
+        self.pre_spin = dspin(0.2, 200, 5, 1, " ms", 84, slot=self.schedule,
+                              tip="Duration kept before the impulse response peak")
+        self.post_spin = dspin(1, 3000, 100, 1, " ms", 84, slot=self.schedule,
+                               tip="Duration kept after the peak. Shorter = ignores reflections, "
+                                   "but low-frequency resolution ≈ 1000 / duration Hz")
+        h.addWidget(muted("Window"))
         h.addWidget(self.pre_spin)
         h.addWidget(muted("/"))
         h.addWidget(self.post_spin)
         h.addStretch()
 
-        exp = QtWidgets.QPushButton("Exporter")
+        exp = QtWidgets.QPushButton("Export")
         menu = QtWidgets.QMenu(exp)
-        menu.addAction("Courbes de réponse (CSV)…", self.export_response_csv)
-        menu.addAction("Courbes de différence (CSV)…", self.export_diff_csv)
-        menu.addAction("Tableau des réglages (CSV)…", self.export_settings_csv)
-        menu.addAction("Courbes de correction EQ (TXT)…", self.export_eq)
-        menu.addAction("Données de rotation (CSV)…", self.export_rotation_csv)
+        menu.addAction("Response curves (CSV)…", self.export_response_csv)
+        menu.addAction("Difference curves (CSV)…", self.export_diff_csv)
+        menu.addAction("Settings table (CSV)…", self.export_settings_csv)
+        menu.addAction("EQ correction curves (TXT)…", self.export_eq)
+        menu.addAction("Rotation data (CSV)…", self.export_rotation_csv)
         menu.addSeparator()
-        menu.addAction("Réponses impulsionnelles (WAV)…", self.export_irs)
-        menu.addAction("Image de l'onglet (PNG)…", self.export_png)
+        menu.addAction("Impulse responses (WAV)…", self.export_irs)
+        menu.addAction("Tab image (PNG)…", self.export_png)
         exp.setMenu(menu)
         h.addWidget(exp)
         return bar
@@ -530,19 +582,17 @@ class MainWindow(QtWidgets.QMainWindow):
         outer = QtWidgets.QVBoxLayout(w)
         outer.addStretch(2)
         col = QtWidgets.QWidget()
-        col.setMaximumWidth(560)
+        col.setMaximumWidth(580)
         v = QtWidgets.QVBoxLayout(col)
-        v.setSpacing(14)
-        t = QtWidgets.QLabel("Mesurer la phase de tes prises")
+        v.setSpacing(12)
+        t = QtWidgets.QLabel("Measure, compare, align")
         t.setObjectName("Title")
         v.addWidget(t)
-        v.addWidget(muted("Trois étapes. Le signal est créé ici, joué et enregistré dans "
-                          "Reaper, puis analysé ici.", wrap=True))
-        v.addSpacing(8)
+        v.addWidget(muted("The signal is created here, played and recorded in Reaper, then analyzed here.", wrap=True))
+        v.addSpacing(6)
 
         def step(num, title, desc, buttons):
-            fr = QtWidgets.QFrame()
-            fr.setObjectName("Card")
+            fr = card()
             hl = QtWidgets.QHBoxLayout(fr)
             hl.setContentsMargins(14, 12, 14, 12)
             n = QtWidgets.QLabel(num)
@@ -560,22 +610,31 @@ class MainWindow(QtWidgets.QMainWindow):
             v.addWidget(fr)
             return tl
 
-        b1 = QtWidgets.QPushButton("Générer")
+        b1 = QtWidgets.QPushButton("Generate")
         b1.setObjectName("Primary")
         b1.clicked.connect(self.generate_signal)
-        b1b = QtWidgets.QPushButton("Charger")
+        b1b = QtWidgets.QPushButton("Load")
         b1b.clicked.connect(self.load_signal_dialog)
-        self.w_step1 = step("1", "Créer le signal de test",
-                            "Un sweep logarithmique est recommandé.", [b1, b1b])
-        b2 = QtWidgets.QPushButton("Guide Reaper")
+        self.w_step1 = step("1", "Create the test signal",
+                            "Sweep, pink noise, periodic noise, MLS, sine…", [b1, b1b])
+        b2 = QtWidgets.QPushButton("Reaper guide")
         b2.clicked.connect(self.show_guide)
-        step("2", "Le jouer et l'enregistrer dans Reaper",
-             "Signal posé à 0:00, une prise par position ou angle de micro.", [b2])
-        self.w_b3 = QtWidgets.QPushButton("Importer")
+        step("2", "Play and record it in Reaper",
+             "Signal placed at 0:00. With a loopback, any signal (even music) works.", [b2])
+        self.w_b3 = QtWidgets.QPushButton("Import")
         self.w_b3.setObjectName("Primary")
         self.w_b3.clicked.connect(self.import_dialog)
-        step("3", "Importer les prises",
-             "Ou glisse simplement les fichiers WAV dans la fenêtre.", [self.w_b3])
+        step("3", "Import the takes", "Or simply drag the WAV files into the window.", [self.w_b3])
+        b5 = QtWidgets.QPushButton("Real time")
+        b5.setObjectName("Primary")
+        b5.clicked.connect(lambda: self.goto_tab("live"))
+        step("◆", "Measure in real time",
+             "Like Open Sound Meter: generator, spectrum, transfer function, coherence and delay "
+             "live. Simulation mode to try it without an interface.", [b5])
+        b4 = QtWidgets.QPushButton("Open the analyzer")
+        b4.clicked.connect(lambda: self.goto_tab("rta"))
+        step("◆", "Analyze a mix, create a target, apply an EQ",
+             "Spectrum, spectrogram, LUFS, mix targets and parametric EQ, no test signal needed.", [b4])
         h = QtWidgets.QHBoxLayout()
         h.addStretch()
         h.addWidget(col)
@@ -585,17 +644,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     def _plot_area(self):
-        glw = pg.GraphicsLayoutWidget()
-        glw.ci.setContentsMargins(6, 10, 12, 6)
-        glw.ci.setSpacing(6)
-        return glw
+        return plot_area()
 
     def _readout(self):
-        lab = QtWidgets.QLabel(" ")
-        lab.setObjectName("Readout")
-        lab.setTextFormat(Qt.RichText)
-        lab.setWordWrap(True)
-        return lab
+        return readout()
 
     def _build_resp_tab(self):
         w = QtWidgets.QWidget()
@@ -604,31 +656,46 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setSpacing(0)
         opts = QtWidgets.QHBoxLayout()
         opts.setContentsMargins(14, 6, 14, 0)
-        self.gd_check = QtWidgets.QCheckBox("Retard de groupe")
+        self.norm_check = QtWidgets.QCheckBox("Level normalized at 1 kHz")
+        self.norm_check.toggled.connect(self.schedule)
+        self.gd_check = QtWidgets.QCheckBox("Group delay")
         self.gd_check.setChecked(True)
         self.gd_check.toggled.connect(self.schedule)
-        self.norm_check = QtWidgets.QCheckBox("Niveau normalisé à 1 kHz")
-        self.norm_check.toggled.connect(self.schedule)
-        opts.addWidget(self.norm_check)
-        opts.addSpacing(16)
-        opts.addWidget(self.gd_check)
+        self.coh_check = QtWidgets.QCheckBox("Coherence")
+        self.coh_check.setChecked(True)
+        self.coh_check.setToolTip("Reliability of the measurement at each frequency (dual-channel and periodic measurements)")
+        self.coh_check.toggled.connect(self.schedule)
+        self.coh_thr = dspin(0, 0.99, 0, 2, "", 56, 0.05, slot=self.schedule,
+                             tip="Hides the areas where coherence is below this threshold (0 = never)")
+        for wdg in (self.norm_check, self.gd_check, self.coh_check):
+            opts.addWidget(wdg)
+            opts.addSpacing(14)
+        opts.addWidget(muted("Hide below"))
+        opts.addWidget(self.coh_thr)
         opts.addStretch()
         v.addLayout(opts)
         self.resp_glw = self._plot_area()
-        self.p_mag = freq_plot("Niveau (dB)")
+        self.p_mag = freq_plot("Level (dB)")
         self.p_ph = freq_plot("Phase (°)")
-        self.p_gd = freq_plot("Retard de groupe (ms)")
+        self.p_gd = freq_plot("Group delay (ms)")
+        self.p_coh = freq_plot("Coherence")
         self.resp_glw.addItem(self.p_mag, 0, 0)
         self.resp_glw.addItem(self.p_ph, 1, 0)
         self.resp_glw.addItem(self.p_gd, 2, 0)
-        for p in (self.p_ph, self.p_gd):
+        self.resp_glw.addItem(self.p_coh, 3, 0)
+        self.resp_glw.ci.layout.setRowStretchFactor(0, 3)
+        self.resp_glw.ci.layout.setRowStretchFactor(1, 3)
+        self.resp_glw.ci.layout.setRowStretchFactor(2, 2)
+        self.resp_glw.ci.layout.setRowStretchFactor(3, 1)
+        for p in (self.p_ph, self.p_gd, self.p_coh):
             p.setXLink(self.p_mag)
         v.addWidget(self.resp_glw, 1)
         self.resp_readout = self._readout()
         v.addWidget(self.resp_readout)
         self.resp_lines = []
+        self.resp_data = []
         self.resp_glw.scene().sigMouseMoved.connect(
-            lambda pos: self._freq_hover(pos, [self.p_mag, self.p_ph, self.p_gd], "resp"))
+            lambda pos: self._freq_hover(pos, [self.p_mag, self.p_ph, self.p_gd, self.p_coh], "resp"))
         return w
 
     def _build_time_tab(self):
@@ -648,7 +715,7 @@ class MainWindow(QtWidgets.QMainWindow):
         opts.addWidget(self.time_info, 1)
         v.addLayout(opts)
         self.time_glw = self._plot_area()
-        self.p_time = lin_plot("Amplitude", "Temps (ms)")
+        self.p_time = lin_plot("Amplitude", "Time (ms)")
         self.time_glw.addItem(self.p_time)
         v.addWidget(self.time_glw, 1)
         self.time_glw.scene().sigMouseMoved.connect(self._time_hover)
@@ -670,10 +737,10 @@ class MainWindow(QtWidgets.QMainWindow):
             s.valueChanged.connect(self.schedule)
             return s
 
-        self.fit_lo = fspin(100, "Bande utilisée pour calculer retard, rotation et gain")
-        self.fit_hi = fspin(10000, "Bande utilisée pour calculer retard, rotation et gain")
+        self.fit_lo = fspin(100, "Band used to compute delay, rotation and gain")
+        self.fit_hi = fspin(10000, "Band used to compute delay, rotation and gain")
         opts.setSpacing(6)
-        opts.addWidget(muted("Bande de calcul"))
+        opts.addWidget(muted("Fit band"))
         opts.addWidget(self.fit_lo)
         opts.addWidget(muted("–"))
         opts.addWidget(self.fit_hi)
@@ -681,12 +748,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.temp_spin = QtWidgets.QDoubleSpinBox()
         self.temp_spin.setRange(-20, 50); self.temp_spin.setValue(20); self.temp_spin.setSuffix(" °C")
         self.temp_spin.setFixedWidth(70)
-        self.temp_spin.setToolTip("Température de l'air, pour convertir les retards en distance")
+        self.temp_spin.setToolTip("Air temperature, to convert delays into distance")
         self.temp_spin.valueChanged.connect(self.schedule)
         opts.addWidget(muted("Air"))
         opts.addWidget(self.temp_spin)
         opts.addStretch()
-        copy = QtWidgets.QPushButton("Copier les réglages")
+        copy = QtWidgets.QPushButton("Copy settings")
         copy.clicked.connect(self.copy_settings)
         opts.addWidget(copy)
         v.addLayout(opts)
@@ -698,9 +765,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tv.setContentsMargins(0, 0, 0, 0)
         tv.setSpacing(0)
         self.diff_glw = self._plot_area()
-        self.p_dmag = freq_plot("Δ niveau (dB)")
+        self.p_dmag = freq_plot("Δ level (dB)")
         self.p_dph = freq_plot("Δ phase (°)")
-        self.p_sum = freq_plot("Somme (dB)")
+        self.p_sum = freq_plot("Sum (dB)")
         self.diff_glw.addItem(self.p_dmag, 0, 0)
         self.diff_glw.addItem(self.p_dph, 1, 0)
         self.diff_glw.addItem(self.p_sum, 2, 0)
@@ -713,8 +780,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.set_table = QtWidgets.QTableWidget(0, 10)
         self.set_table.setHorizontalHeaderLabels(
-            ["Prise", "Retard (ms)", "Échantillons", "Distance (cm)", "Polarité",
-             "Rotation (°)", "Gain (dB)", "Écart résiduel", "1er creux (somme)", "Correction à appliquer"])
+            ["Take", "Delay (ms)", "Samples", "Distance (cm)", "Polarity",
+             "Rotation (°)", "Gain (dB)", "Residual deviation", "1st notch (sum)", "Correction to apply"])
         self.set_table.verticalHeader().setVisible(False)
         self.set_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.set_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -725,9 +792,9 @@ class MainWindow(QtWidgets.QMainWindow):
             hh.setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(9, QtWidgets.QHeaderView.Stretch)
         self.set_table.setToolTip(
-            "Retard > 0 : la prise arrive après la référence.\n"
-            "Rotation : déphasage constant restant une fois retard et polarité corrigés.\n"
-            "Écart résiduel : ce que retard + rotation n'expliquent pas (° RMS dans la bande).")
+            "Delay > 0: the take arrives after the reference.\n"
+            "Rotation: constant phase shift remaining once delay and polarity are corrected.\n"
+            "Residual deviation: what delay + rotation do not explain (° RMS in the band).")
         split.addWidget(self.set_table)
         split.setSizes([620, 200])
         v.addWidget(split, 1)
@@ -743,17 +810,17 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setSpacing(0)
         opts = QtWidgets.QHBoxLayout()
         opts.setContentsMargins(14, 6, 14, 0)
-        opts.addWidget(muted("Fréquences"))
+        opts.addWidget(muted("Frequencies"))
         self.rot_freqs = QtWidgets.QLineEdit("125, 500, 1000, 4000, 10000")
         self.rot_freqs.setFixedWidth(260)
-        self.rot_freqs.setToolTip("Fréquences suivies en fonction de l'angle, séparées par des virgules")
+        self.rot_freqs.setToolTip("Frequencies tracked versus angle, comma-separated")
         self.rot_freqs.editingFinished.connect(self.schedule)
         opts.addWidget(self.rot_freqs)
         opts.addSpacing(14)
-        self.rot_unwrap = QtWidgets.QCheckBox("Phase déroulée")
+        self.rot_unwrap = QtWidgets.QCheckBox("Unwrapped phase")
         self.rot_unwrap.setChecked(True)
-        self.rot_unwrap.setToolTip("Déroulée : la phase cumule les tours depuis le grave (aucune ambiguïté).\n"
-                                   "Décoche pour l'afficher entre −180° et +180°.")
+        self.rot_unwrap.setToolTip("Unwrapped: the phase accumulates turns from the low end (no ambiguity).\n"
+                                   "Untick to show it between −180° and +180°.")
         self.rot_unwrap.toggled.connect(self.schedule)
         opts.addWidget(self.rot_unwrap)
         opts.addSpacing(14)
@@ -762,10 +829,10 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addLayout(opts)
         self.rot_glw = self._plot_area()
         self.p_rph = lin_plot("Δ phase (°)", "Angle (°)")
-        self.p_rmag = lin_plot("Δ niveau (dB)", "Angle (°)")
-        self.p_rt = lin_plot("Δ temps (µs)", "Angle (°)")
+        self.p_rmag = lin_plot("Δ level (dB)", "Angle (°)")
+        self.p_rt = lin_plot("Δ time (µs)", "Angle (°)")
         self.p_rmap = freq_plot("Angle (°)")
-        self.p_rmap.setTitle("Δ phase selon fréquence et angle", color=C["muted"], size="9pt")
+        self.p_rmap.setTitle("Δ phase versus frequency and angle", color=C["muted"], size="9pt")
         self.rot_glw.addItem(self.p_rph, 0, 0)
         self.rot_glw.addItem(self.p_rmag, 0, 1)
         self.rot_glw.addItem(self.p_rt, 1, 0)
@@ -780,54 +847,72 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_menu(self):
         mb = self.menuBar()
-        m = mb.addMenu("Fichier")
-        m.addAction("Nouveau projet", self.new_project, QtGui.QKeySequence.New)
-        m.addAction("Ouvrir un projet…", self.open_project, QtGui.QKeySequence.Open)
-        m.addAction("Enregistrer le projet", self.save_project, QtGui.QKeySequence.Save)
-        m.addAction("Enregistrer sous…", lambda: self.save_project(True), QtGui.QKeySequence.SaveAs)
+        m = mb.addMenu("File")
+        m.addAction("New project", self.new_project, QtGui.QKeySequence.New)
+        m.addAction("Open project…", self.open_project, QtGui.QKeySequence.Open)
+        m.addAction("Save project", self.save_project, QtGui.QKeySequence.Save)
+        m.addAction("Save as…", lambda: self.save_project(True), QtGui.QKeySequence.SaveAs)
         m.addSeparator()
-        m.addAction("Quitter", self.close, QtGui.QKeySequence.Quit)
+        m.addAction("Quit", self.close, QtGui.QKeySequence.Quit)
         m = mb.addMenu("Signal")
-        m.addAction("Générer un signal…", self.generate_signal, "Ctrl+G")
-        m.addAction("Charger un signal…", self.load_signal_dialog)
-        m = mb.addMenu("Prises")
-        m.addAction("Importer des prises…", self.import_dialog, "Ctrl+I")
-        m.addAction("Retirer la prise sélectionnée", self.remove_selected, QtGui.QKeySequence.Delete)
-        m.addAction("Définir comme référence", self.set_selected_as_ref, "Ctrl+R")
-        m.addAction("Tout afficher", lambda: self._set_all_visible(True))
-        m.addAction("Tout masquer", lambda: self._set_all_visible(False))
-        m = mb.addMenu("Aide")
+        m.addAction("Generate a signal…", self.generate_signal, "Ctrl+G")
+        m.addAction("Load a signal…", self.load_signal_dialog)
+        m = mb.addMenu("Takes")
+        m.addAction("Import takes…", self.import_dialog, "Ctrl+I")
+        m.addAction("Combine measurements…", self.combine_dialog, "Ctrl+M")
+        m.addAction("Remove the selected take", self.remove_selected, QtGui.QKeySequence.Delete)
+        m.addAction("Set as reference", self.set_selected_as_ref, "Ctrl+R")
+        m.addAction("Reset all adjustments", self._adjust_reset_all)
+        m.addSeparator()
+        m.addAction("Show all", lambda: self._set_all_visible(True))
+        m.addAction("Hide all", lambda: self._set_all_visible(False))
+        m = mb.addMenu("Audio")
+        m.addAction("Add audio files (mixes, references)…", self.rta_tab.add_dialog, "Ctrl+Shift+A")
+        m.addAction("Open the analyzer", lambda: self.goto_tab("rta"))
+        m.addAction("Real time: start / stop", self._toggle_live, "Ctrl+L")
+        m.addAction("Open the EQ", lambda: self.goto_tab("eq"))
+        m = mb.addMenu("Help")
         m.addAction("Guide", self.show_guide, QtGui.QKeySequence.HelpContents)
 
-    # ------------------------------------------------------------- état / UI
+    # ------------------------------------------------------------- state / UI
     def status(self, text):
         self.status_msg.setText(text)
 
     def schedule(self, *_):
         self._timer.start()
 
+    def goto_tab(self, key):
+        self._force_tabs = True
+        self._update_welcome()
+        idx = [k for k, _ in TABS].index(key)
+        self.tabs.setCurrentIndex(idx)
+        self._draw_current()
+
     def _update_signal_card(self):
         s = self.signal
         if not s:
-            self.sig_name.setText("Aucun signal")
-            self.sig_info.setText("Génère ou charge le signal joué dans Reaper.")
+            self.sig_name.setText("No signal")
+            self.sig_info.setText("Generate or load the signal played in Reaper "
+                                  "(optional with a loopback).")
             self.btn_gen.setObjectName("Primary")
         else:
             self.sig_name.setText(s.name)
             dur = len(s.data) / s.fs
-            self.sig_info.setText(
-                f"{s.label} · {s.fs} Hz · {dur:.2f} s\n"
-                f"Bande {short_hz(round(s.f1, 1))} – {short_hz(round(s.f2))} Hz")
+            extra = ""
+            if s.periodic:
+                extra = f" · {s.meta['repeats']} × {s.meta['period'] / s.fs:.2f} s"
+            band = f"Band {short_hz(round(s.f1, 1))} – {short_hz(round(s.f2))} Hz" if s.kind != "sine" \
+                else f"{s.f1:g} Hz"
+            self.sig_info.setText(f"{s.label} · {s.fs} Hz · {dur:.2f} s{extra}\n{band}")
             self.btn_gen.setObjectName("")
         self.btn_gen.style().unpolish(self.btn_gen)
         self.btn_gen.style().polish(self.btn_gen)
-        self.btn_import.setEnabled(s is not None)
 
     def _update_welcome(self):
         ok = self.signal is not None
-        self.w_step1.setText("Créer le signal de test" + ("   ✓ " + self.signal.name if ok else ""))
-        self.w_b3.setEnabled(ok)
-        self.stack.setCurrentIndex(1 if self.meas else 0)
+        self.w_step1.setText("Create the test signal" + ("   ✓ " + self.signal.name if ok else ""))
+        show = bool(self.meas or self.audio_files or self._force_tabs)
+        self.stack.setCurrentIndex(1 if show else 0)
 
     def _next_color(self):
         c = PALETTE[self._color_i % len(PALETTE)]
@@ -843,9 +928,17 @@ class MainWindow(QtWidgets.QMainWindow):
             it.setCheckState(Qt.Checked if m.visible else Qt.Unchecked)
             it.setIcon(color_icon(m.color))
             self.table.setItem(r, 0, it)
-            name = m.name + ("  ★" if m is self.ref else "")
+            name = m.name + ("  ★" if m is self.ref else "") + ("  ±" if m.adjusted else "")
             it = QtWidgets.QTableWidgetItem(name)
-            it.setToolTip(f"{m.path}\ncanal {m.channel + 1}" + (" · loopback" if m.loopback else ""))
+            tip = f"{m.path or 'combined measurement'}"
+            if not m.virtual:
+                tip += f"\ncanal {m.channel + 1}" + (" · loopback" if m.loopback else "")
+            tip += f"\n{dsp.METHOD_LABELS.get(m.method, m.method)}"
+            if m.averages > 1:
+                tip += f" · {m.averages} averages"
+            if m.adjusted:
+                tip += f"\nadjusted: {m.offset_ms:+.3f} ms, {m.gain_db:+.1f} dB" + (", polarity inverted" if m.invert else "")
+            it.setToolTip(tip)
             self.table.setItem(r, 1, it)
             it = QtWidgets.QTableWidgetItem("" if m.angle is None else f"{m.angle:g}")
             it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -856,7 +949,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if c == 4 and m.snr_db < 40:
                     it.setForeground(QtGui.QColor(C["warn"]))
-                    it.setToolTip("Rapport signal/bruit faible : monte le niveau ou allonge le sweep")
+                    it.setToolTip("Low signal-to-noise ratio: raise the level or lengthen the signal")
                 self.table.setItem(r, c, it)
             if m is self.sel:
                 self.table.selectRow(r)
@@ -865,7 +958,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _rebuild_ref_combo(self):
         self.ref_combo.blockSignals(True)
         self.ref_combo.clear()
-        self.ref_combo.addItem("Signal original")
+        self.ref_combo.addItem("Original signal / loopback")
         for m in self.meas:
             self.ref_combo.addItem(color_icon(m.color), m.name)
         idx = self.meas.index(self.ref) + 1 if self.ref in self.meas else 0
@@ -879,7 +972,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sel = None
         self._rebuild_table()
         self._rebuild_ref_combo()
+        self.lists_changed()
+
+    def lists_changed(self):
+        """The takes / files lists changed: updates the tabs that depend on them."""
+        self.align_tab.rebuild_lists()
+        self.eq_tab.rebuild_sources()
         self._update_welcome()
+        self._update_adjust_card()
+        self._dirty = {k for k, _ in TABS}
         self.schedule()
 
     def _table_item_changed(self, it):
@@ -900,7 +1001,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 m.angle = float(txt) if txt else None
             except ValueError:
-                self.status("Angle invalide : saisis un nombre en degrés.")
+                self.status("Invalid angle: enter a number in degrees.")
             self._refresh_lists()
 
     def _table_selection(self):
@@ -908,6 +1009,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         rows = self.table.selectionModel().selectedRows()
         self.sel = self.meas[rows[0].row()] if rows else None
+        self._update_adjust_card()
+        self._dirty = {k for k, _ in TABS}
         self.schedule()
 
     def _set_all_visible(self, v):
@@ -925,15 +1028,60 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ref = self.sel
             self._refresh_lists()
 
+    # ------------------------------------------------------------ adjustments
+    def _update_adjust_card(self):
+        m = self.sel
+        self.adj_card.setEnabled(m is not None)
+        for w, val in ((self.adj_delay, m.offset_ms if m else 0.0), (self.adj_gain, m.gain_db if m else 0.0)):
+            w.blockSignals(True)
+            w.setValue(val)
+            w.blockSignals(False)
+        self.adj_inv.blockSignals(True)
+        self.adj_inv.setChecked(bool(m and m.invert))
+        self.adj_inv.blockSignals(False)
+
+    def _adjust_edited(self, *_):
+        m = self.sel
+        if m is None:
+            return
+        m.offset_ms = self.adj_delay.value()
+        m.gain_db = self.adj_gain.value()
+        m.invert = self.adj_inv.isChecked()
+        self.adjustments_changed(update_card=False)
+
+    def _adjust_reset(self):
+        if self.sel:
+            self.sel.reset_adjust()
+            self.adjustments_changed()
+
+    def _adjust_reset_all(self):
+        for m in self.meas:
+            m.reset_adjust()
+        self.adjustments_changed()
+
+    def adjustments_changed(self, update_card=True):
+        self._orig_cache.clear()
+        if update_card:
+            self._update_adjust_card()
+        self._rebuild_table()
+        self._dirty = {k for k, _ in TABS}
+        self.schedule()
+
     # --------------------------------------------------------------- signal
     def generate_signal(self):
         dlg = GenerateDialog(self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         spec = dlg.spec()
-        default = f"phaselab_{spec.kind}_{spec.fs // 1000}k_{spec.duration:g}s.wav"
+        if spec.kind in dsp.PERIODIC_KINDS:
+            tag = f"{spec.repeats}x2e{spec.period_pow}"
+        elif spec.kind == "sine":
+            tag = f"{spec.sine_freq:g}Hz_{spec.duration:g}s"
+        else:
+            tag = f"{spec.duration:g}s"
+        default = f"phaselab_{spec.kind}_{spec.fs // 1000}k_{tag}.wav"
         start = str(Path(self.signal.path).parent / default) if self.signal and self.signal.path else default
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Enregistrer le signal", start, "WAV (*.wav)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save the signal", start, "WAV (*.wav)")
         if not path:
             return
         if not path.lower().endswith(".wav"):
@@ -943,10 +1091,10 @@ class MainWindow(QtWidgets.QMainWindow):
             sig = dsp.TestSignal(x, spec.fs, meta)
             sig.save(path)
         self.set_signal(sig)
-        self.status(f"Signal enregistré : {Path(path).name}. Glisse-le à 0:00 dans Reaper.")
+        self.status(f"Signal saved: {Path(path).name}. Drag it to 0:00 in Reaper.")
 
     def load_signal_dialog(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Charger le signal de test", "", "WAV (*.wav)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load the test signal", "", "WAV (*.wav)")
         if path:
             self.load_signal(path)
 
@@ -954,10 +1102,10 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             sig = dsp.TestSignal.load(path)
         except Exception as e:
-            self.error("Impossible de lire le signal", str(e))
+            self.error("Cannot read the signal", str(e))
             return
         if sig.kind == "inconnu":
-            self.status("Signal sans fichier .phaselab.json : bande d'analyse par défaut 20 Hz – 20 kHz.")
+            self.status("Signal without a .phaselab.json file: default analysis band 20 Hz – 20 kHz.")
         self.set_signal(sig)
 
     def set_signal(self, sig):
@@ -967,83 +1115,117 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reload_measurements()
         self._update_welcome()
         lo, hi = max(sig.f1, 20), min(sig.f2, 0.45 * sig.fs)
-        self.fit_lo.setValue(max(100, lo))
-        self.fit_hi.setValue(min(10000, hi))
+        if sig.kind != "sine":
+            self.fit_lo.setValue(max(100, lo))
+            self.fit_hi.setValue(min(10000, hi))
         self.schedule()
 
-    # --------------------------------------------------------------- prises
+    # --------------------------------------------------------------- takes
+    def _can_measure(self):
+        return self.signal is not None or self.loop_combo.currentData() > 0
+
     def import_dialog(self):
-        if not self.signal:
-            self.error("Signal manquant", "Génère ou charge d'abord le signal de test.")
+        if not self._can_measure():
+            self.error("Missing reference",
+                       "Generate or load the test signal first, or set the loopback channel "
+                       "(dual-channel measurement with any signal).")
             return
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Importer des prises", "", "Audio (*.wav *.flac *.aif *.aiff)")
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Import takes", "",
+                                                          "Audio (*.wav *.flac *.aif *.aiff)")
         if paths:
             self.import_takes(paths)
 
+    def _load(self, path):
+        return dsp.load_takes(path, self.signal, self.loop_combo.currentData(),
+                              self.method_combo.currentData(), self.nfft_combo.currentData())
+
     def import_takes(self, paths):
-        if not self.signal:
-            self.error("Signal manquant", "Génère ou charge d'abord le signal de test.")
+        if not self._can_measure():
+            self.error("Missing reference", "Load the test signal or set the loopback channel.")
             return
-        loop = self.loop_combo.currentData()
-        existing = {(m.path, m.channel) for m in self.meas}
+        existing = {m.key for m in self.meas}
+        fs0 = self.meas[0].fs if self.meas else None
         was_empty = not self.meas
         errors, added = [], 0
         with busy():
             for p in paths:
-                if self.signal.path and Path(p).resolve() == Path(self.signal.path).resolve():
+                if self.signal and self.signal.path and Path(p).resolve() == Path(self.signal.path).resolve():
                     continue
                 try:
-                    new = dsp.load_takes(p, self.signal, loop)
+                    new = self._load(p)
                 except Exception as e:
-                    errors.append(f"{Path(p).name} : {e}")
+                    errors.append(f"{Path(p).name}: {e}")
                     continue
                 for m in new:
-                    if (m.path, m.channel) in existing:
+                    if m.key in existing:
                         continue
+                    if fs0 and m.fs != fs0:
+                        errors.append(f"{m.name}: {m.fs} Hz instead of {fs0} Hz")
+                        continue
+                    fs0 = m.fs
                     m.color = self._next_color()
                     self.meas.append(m)
                     added += 1
-                self.status(f"Analyse… {added} prise(s)")
+                self.status(f"Analyzing… {added} take(s)")
                 QtWidgets.QApplication.processEvents()
         if was_empty and self.meas:
             self.ref = self.meas[0]
             self.sel = self.meas[1] if len(self.meas) > 1 else self.meas[0]
+        self._spec_cache.clear()
         self._refresh_lists()
-        self.status(f"{added} prise(s) importée(s).")
+        meth = {dsp.METHOD_LABELS.get(m.method) for m in self.meas[-added:]} if added else set()
+        self.status(f"{added} take(s) imported" + (f" · {', '.join(sorted(meth))}" if meth else "") + ".")
         if errors:
-            self.error("Certaines prises n'ont pas pu être lues", "\n".join(errors))
+            self.error("Some takes could not be read", "\n".join(errors))
 
     def reload_measurements(self):
-        """Recalcule toutes les prises (après changement de signal ou de loopback)."""
-        old = {(m.path, m.channel): m for m in self.meas}
-        ref_key = (self.ref.path, self.ref.channel) if self.ref else None
-        sel_key = (self.sel.path, self.sel.channel) if self.sel else None
-        paths = list(dict.fromkeys(m.path for m in self.meas))
-        loop = self.loop_combo.currentData()
+        """Recomputes all takes (after a change of signal, loopback or method)."""
+        old = {m.key: m for m in self.meas}
+        ref_key = self.ref.key if self.ref else None
+        sel_key = self.sel.key if self.sel else None
+        paths = list(dict.fromkeys(m.path for m in self.meas if not m.virtual))
+        virtuals = [m for m in self.meas if m.virtual]
         new, errors = [], []
         with busy():
             for p in paths:
                 try:
-                    for m in dsp.load_takes(p, self.signal, loop):
-                        o = old.get((m.path, m.channel))
+                    for m in self._load(p):
+                        o = old.get(m.key)
                         if o:
                             m.name, m.angle, m.visible, m.color = o.name, o.angle, o.visible, o.color
+                            m.offset_ms, m.gain_db, m.invert = o.offset_ms, o.gain_db, o.invert
                         else:
                             m.color = self._next_color()
                         new.append(m)
                 except Exception as e:
-                    errors.append(f"{Path(p).name} : {e}")
+                    errors.append(f"{Path(p).name}: {e}")
+        for vm in virtuals:
+            nm = self._rebuild_virtual(vm, new)
+            if nm is not None:
+                new.append(nm)
         self.meas = new
         self._spec_cache.clear()
         self._orig_cache.clear()
-        self.ref = next((m for m in new if (m.path, m.channel) == ref_key), None)
-        self.sel = next((m for m in new if (m.path, m.channel) == sel_key), None)
+        self.ref = next((m for m in new if m.key == ref_key), None)
+        self.sel = next((m for m in new if m.key == sel_key), None)
         self._refresh_lists()
         if errors:
-            self.error("Certaines prises n'ont pas pu être recalculées", "\n".join(errors))
+            self.error("Some takes could not be recomputed", "\n".join(errors))
+
+    def _rebuild_virtual(self, vm, pool):
+        if vm.recipe is None:      # trace stored in real time: nothing to recompute
+            return vm
+        try:
+            srcs = [next(m for m in pool if list(m.key) == list(k)) for k in vm.recipe["sources"]]
+            nm = dsp.combine(srcs, vm.recipe["op"], vm.name)
+        except Exception:
+            return None
+        nm.color, nm.visible, nm.angle = vm.color, vm.visible, vm.angle
+        nm.offset_ms, nm.gain_db, nm.invert = vm.offset_ms, vm.gain_db, vm.invert
+        return nm
 
     def _loop_changed(self):
-        if self.meas and self.signal:
+        if self.meas and self._can_measure():
             self.reload_measurements()
 
     def remove_selected(self):
@@ -1053,42 +1235,122 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sel = None
             self._refresh_lists()
 
-    # ------------------------------------------------------------- glisser
+    def add_measurement(self, m):
+        """Adds a measurement (e.g. stored in real time) to the takes list."""
+        if self.meas and m.fs != self.meas[0].fs:
+            return self.error("Different sample rate", f"{m.fs} Hz instead of {self.meas[0].fs} Hz.")
+        base, k = m.name, 2
+        while any(x.name == m.name for x in self.meas):
+            m.name = f"{base} {k}"
+            k += 1
+        m.color = self._next_color()
+        self.meas.append(m)
+        if self.ref is None and len(self.meas) == 1:
+            self.ref = m
+        self.sel = m
+        self._refresh_lists()
+
+    def _toggle_live(self):
+        self.goto_tab("live")
+        self.live_tab.toggle()
+
+    def closeEvent(self, ev):
+        self.live_tab.stop()
+        super().closeEvent(ev)
+
+    def combine_dialog(self):
+        if len(self.meas) < 2:
+            return self.error("Not enough measurements", "At least two measurements are needed.")
+        dlg = CombineDialog(self.meas, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        ms = [self.meas[i] for i in dlg.chosen()]
+        try:
+            with busy():
+                nm = dsp.combine(ms, dlg.op.currentData(), dlg.name.text().strip() or "Combination")
+        except Exception as e:
+            return self.error("Combination not possible", str(e))
+        base, k = nm.name, 2
+        while any(m.name == nm.name for m in self.meas):
+            nm.name = f"{base} {k}"
+            k += 1
+        nm.color = self._next_color()
+        self.meas.append(nm)
+        self.sel = nm
+        self._refresh_lists()
+        self.status(f"Measurement \"{nm.name}\" created from {len(ms)} measurements.")
+
+    # ------------------------------------------------------------- drag & drop
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
 
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
-        paths = [p for p in paths if Path(p).suffix.lower() in (".wav", ".flac", ".aif", ".aiff")]
+        exts = (".wav", ".flac", ".aif", ".aiff", ".ogg", ".mp3")
+        projects = [p for p in paths if p.endswith(".phaselab")]
+        if projects:
+            return self.open_project(projects[0])
+        paths = [p for p in paths if Path(p).suffix.lower() in exts]
         if not paths:
             return
+        cur = TABS[self.tabs.currentIndex()][0] if self.stack.currentIndex() == 1 else None
+        if cur in ("rta", "eq"):
+            return self.rta_tab.add_files(paths)
         sigs = [p for p in paths if dsp.sidecar_path(p).exists()]
         takes = [p for p in paths if p not in sigs]
         if sigs:
             self.load_signal(sigs[0])
+        if self.signal is not None and self.loop_combo.currentData() == 0:
+            # a file much longer than the test signal is a mix, not a take
+            limit = len(self.signal.data) / self.signal.fs * 1.5 + 2
+            longs = []
+            for p in takes:
+                try:
+                    if sf.info(p).duration > limit:
+                        longs.append(p)
+                except Exception:
+                    pass
+            if longs:
+                takes = [p for p in takes if p not in longs]
+                self.rta_tab.add_files(longs)
+                self.status(f"{len(longs)} long file(s) added to the spectrum analyzer.")
         if takes:
-            self.import_takes(takes)
+            if self._can_measure():
+                self.import_takes(takes)
+            else:
+                self.rta_tab.add_files(takes)
+                self.goto_tab("rta")
+                self.status("No test signal and no loopback: files added to the spectrum analyzer.")
 
-    # ------------------------------------------------------------- analyse
+    # ------------------------------------------------------------- analysis
     def analyze(self):
-        s = self.signal
-        fs = s.fs
-        fmin = max(s.f1, 10.0)
-        fmax = min(s.f2, 0.48 * fs)
+        if not self.meas:
+            self.A = None
+            return
+        fs = self.meas[0].fs
+        fmin = max(min(m.f1 for m in self.meas), 10.0)
+        fmax = min(max(m.f2 for m in self.meas), 0.48 * fs)
+        if fmax <= fmin * 2:
+            fmin, fmax = 20.0, min(20000.0, 0.48 * fs)
         grid = dsp.log_grid(fmin, fmax, 1500)
         pre, post = self.pre_spin.value(), self.post_spin.value()
         N = dsp.fft_size(fs, pre, post)
         specs = {}
         for m in self.meas:
-            key = (pre, post, N)
+            key = (pre, post, N, m.adj_key)
             cached = self._spec_cache.get(id(m))
             if not cached or cached[0] != key or cached[2] is not m:
                 self._spec_cache[id(m)] = (key, dsp.windowed_spectrum(m, pre, post, N), m)
             specs[id(m)] = self._spec_cache[id(m)][1]
         f = next(iter(specs.values())).f
-        sm = dsp.Smoother(f, grid, self.smooth_combo.currentData())
+        frac = self.smooth_combo.currentData()
+        sm = dsp.Smoother(f, grid, frac)
         curves = {k: dsp.make_curve(sp, sm) for k, sp in specs.items()}
+        coh = {}
+        for m in self.meas:
+            if m.coh is not None:
+                coh[id(m)] = np.clip(dsp.Smoother(m.coh_f, grid, frac or 48)(m.coh), 0, 1)
         ref = self.ref
         if ref is not None:
             sref, cref = specs[id(ref)], curves[id(ref)]
@@ -1105,26 +1367,84 @@ class MainWindow(QtWidgets.QMainWindow):
             comps[id(m)] = dsp.compare(specs[id(m)], sref, curves[id(m)], cref, sm, fs, lo, hi,
                                        with_sum=ref is not None,
                                        search_ms=max(20.0, self.post_spin.value()))
-        self.A = dict(grid=grid, specs=specs, curves=curves, comps=comps, band=(lo, hi),
+        self.A = dict(grid=grid, specs=specs, curves=curves, comps=comps, band=(lo, hi), coh=coh, sm=sm,
                       wrapped=self.wrap_combo.currentIndex() == 0,
                       dmode=self.delay_combo.currentData(), fs=fs)
 
     def refresh_all(self):
-        if not self.signal or not self.meas:
-            self.stack.setCurrentIndex(0)
+        self._update_welcome()
+        if self.stack.currentIndex() == 0:
             return
-        self.stack.setCurrentIndex(1)
         try:
             with busy():
                 self.analyze()
-                self.draw_response()
-                self.draw_time()
-                self.draw_diff()
-                self.draw_rotation()
-        except Exception as e:  # garde l'appli vivante quoi qu'il arrive
+        except Exception as e:  # keeps the app alive whatever happens
             import traceback
             traceback.print_exc()
-            self.status(f"Erreur d'analyse : {e}")
+            self.status(f"Analysis error: {e}")
+            self.A = None
+        self._dirty = {k for k, _ in TABS}
+        self._draw_current()
+
+    def _draw_current(self, *_):
+        if self.stack.currentIndex() == 0:
+            return
+        key = TABS[self.tabs.currentIndex()][0]
+        if key not in self._dirty:
+            return
+        self._dirty.discard(key)
+        try:
+            with busy():
+                self._ensure_analysis()
+                if key in MEASURE_TABS:
+                    if self.A is None:
+                        self._clear_measure_tabs()
+                    else:
+                        dict(resp=self.draw_response, time=self.draw_time, diff=self.draw_diff,
+                             rot=self.draw_rotation)[key]()
+                elif key == "attack":
+                    self.attack_tab.refresh()
+                elif key == "align":
+                    self.align_tab.refresh()
+                elif key == "rta":
+                    self.rta_tab.refresh()
+                elif key == "eq":
+                    self.eq_tab.refresh()
+                elif key == "live":
+                    self.live_tab.reload_targets()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.status(f"Display error: {e}")
+
+    def _ensure_analysis(self):
+        """Recomputes the analysis if the takes list changed since last time."""
+        ids = {id(m) for m in self.meas}
+        if (self.A is None and self.meas) or (self.A is not None and set(self.A["specs"]) != ids):
+            self.analyze()
+
+    def draw_all(self):
+        """Draws every tab (useful for exports and tests)."""
+        for i in range(self.tabs.count()):
+            self._dirty.add(TABS[i][0])
+            cur = self.tabs.currentIndex()
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(i)
+            self._draw_current()
+            self.tabs.setCurrentIndex(cur)
+            self.tabs.blockSignals(False)
+
+    def _clear_measure_tabs(self):
+        for p in (self.p_mag, self.p_ph, self.p_gd, self.p_coh, self.p_time, self.p_dmag, self.p_dph,
+                  self.p_sum, self.p_rph, self.p_rmag, self.p_rt, self.p_rmap):
+            p.clear()
+        self.set_table.setRowCount(0)
+        msg = "No take: import measured takes (test signal or loopback)."
+        self.resp_readout.setText(f"<span style='color:{C['muted']}'>{msg}</span>")
+        self.diff_readout.setText(f"<span style='color:{C['muted']}'>{msg}</span>")
+        self.time_info.setText(msg)
+        self.rot_info.setText(msg)
+        self.resp_data, self.diff_data, self.sum_target, self.rot_rows = [], [], None, ([], [])
 
     def visible(self):
         return [m for m in self.meas if m.visible]
@@ -1155,15 +1475,18 @@ class MainWindow(QtWidgets.QMainWindow):
         reg.setZValue(-10)
         p.addItem(reg, ignoreBounds=True)
 
-    # -- Réponse
+    # -- Response
     def draw_response(self):
         A = self.A
         grid = A["grid"]
-        for p in (self.p_mag, self.p_ph, self.p_gd):
+        for p in (self.p_mag, self.p_ph, self.p_gd, self.p_coh):
             p.clear()
         self.p_gd.setVisible(self.gd_check.isChecked())
+        show_coh = self.coh_check.isChecked() and bool(A["coh"])
+        self.p_coh.setVisible(show_coh)
         ref_tp = A["curves"][id(self.ref)].tp if self.ref else 0.0
         k1 = int(np.argmin(np.abs(grid - 1000)))
+        thr = self.coh_thr.value()
         self.resp_data = []
         for m in self.visible():
             c = A["curves"][id(m)]
@@ -1173,12 +1496,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 mag = mag - mag[k1]
             ph = c.phase_res_deg() - 360 * grid * (c.tp - tau_rm)
             gd = dsp.group_delay_ms(c, grid, c.tp - tau_rm)
+            coh = A["coh"].get(id(m))
+            mask = None
+            if coh is not None and thr > 0:
+                mask = coh < thr
             w = 2.0 if m is self.sel else 1.3
-            self.p_mag.plot(grid, mag, pen=self._pen(m.color, w))
-            self.p_ph.plot(grid, self._phase(ph), pen=self._pen(m.color, w), connect="finite")
+            pm, pp, pgd = mag.copy(), self._phase(ph), gd.copy()
+            if mask is not None:
+                pm[mask] = np.nan
+                pp = np.where(mask, np.nan, pp)
+                pgd[mask] = np.nan
+            self.p_mag.plot(grid, pm, pen=self._pen(m.color, w), connect="finite")
+            self.p_ph.plot(grid, pp, pen=self._pen(m.color, w), connect="finite")
             if self.gd_check.isChecked():
-                self.p_gd.plot(grid, gd, pen=self._pen(m.color, w))
+                self.p_gd.plot(grid, pgd, pen=self._pen(m.color, w), connect="finite")
+            if show_coh and coh is not None:
+                self.p_coh.plot(grid, coh, pen=self._pen(m.color, 1.1))
             self.resp_data.append((m, mag, dsp.wrap_deg(ph) if A["wrapped"] else ph, gd))
+        if show_coh:
+            self.p_coh.setYRange(0, 1.02, padding=0)
+            if thr > 0:
+                self.p_coh.addItem(pg.InfiniteLine(pos=thr, angle=0, pen=pg.mkPen(C["warn"], style=Qt.DotLine)))
         if A["wrapped"]:
             self.p_ph.setYRange(-185, 185, padding=0)
             self.p_ph.getAxis("left").setTicks([[(v, f"{v}") for v in range(-180, 181, 90)]])
@@ -1190,11 +1528,11 @@ class MainWindow(QtWidgets.QMainWindow):
             lo, hi = np.nanpercentile(allgd, [2, 98])
             pad = max((hi - lo) * 0.15, 0.05)
             self.p_gd.setYRange(lo - pad, hi + pad)
-        self.resp_lines = self._cursor_lines([self.p_mag, self.p_ph, self.p_gd])
+        self.resp_lines = self._cursor_lines([self.p_mag, self.p_ph, self.p_gd, self.p_coh])
         self.p_mag.setXRange(math.log10(grid[0]), math.log10(grid[-1]), padding=0.01)
-        self.resp_readout.setText(f"<span style='color:{C['muted']}'>Survole un graphique pour lire les valeurs.</span>")
+        self.resp_readout.setText(f"<span style='color:{C['muted']}'>Hover over a plot to read the values.</span>")
 
-    # -- Temps
+    # -- Time
     def draw_time(self):
         p = self.p_time
         p.clear()
@@ -1219,7 +1557,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     y = 20 * np.log10(np.maximum(m.env[i0:i1] / gmax, 1e-7))
                 p.plot(t, y, pen=self._pen(m.color, 1.8 if m is self.sel else 1.1))
-            p.setLabel("left", "Amplitude (normalisée)" if mode == "ir" else "Niveau (dB)")
+            p.setLabel("left", "Amplitude (normalized)" if mode == "ir" else "Level (dB)")
             focus = self.sel if self.sel in vis else vis[0]
             reg = pg.LinearRegionItem([(focus.peak_time - pre) * 1e3, (focus.peak_time + post) * 1e3],
                                       movable=False, brush=pg.mkBrush(56, 201, 178, 18),
@@ -1231,33 +1569,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 p.setYRange(-90, 3, padding=0)
             else:
                 p.enableAutoRange(axis="y")
-            lab = "Fenêtre d'analyse affichée pour : " + focus.name
+            lab = "Analysis window shown for: " + focus.name
             pk = " · ".join(f"{m.name} {m.peak_time * 1e3:.3f} ms" for m in vis[:3])
-            self.time_info.setText(f"{lab}   ·   Pics : {pk}{' …' if len(vis) > 3 else ''}")
+            self.time_info.setText(f"{lab}   ·   Peaks: {pk}{' …' if len(vis) > 3 else ''}")
         else:
             m = self.sel if self.sel in vis else vis[0]
+            if m.y is None:
+                self.time_info.setText(f"{m.name} is a combined measurement: no raw take to compare.")
+                return
             key = (id(m), mode)
             if key not in self._orig_cache:
                 self._orig_cache[key] = dsp.original_vs_take(m, mode)
             pred, res, g, rd = self._orig_cache[key]
             t = np.arange(len(m.y)) / m.fs * 1e3
-            p.plot(t, m.y, pen=self._pen(m.color, 1.0), name="Prise")
+            p.plot(t, m.y, pen=self._pen(m.color, 1.0), name="Take")
             p.plot(t, pred, pen=self._pen(C["text"], 0.8), name="Original")
-            p.plot(t, res, pen=self._pen(C["bad"], 0.8), name="Résidu")
+            p.plot(t, res, pen=self._pen(C["bad"], 0.8), name="Residual")
             p.setLabel("left", "Amplitude (FS)")
             p.enableAutoRange()
-            src = "boucle" if m.loopback else "original"
+            src = "loopback" if m.loopback else "original"
             if mode == "aligned":
                 self.time_info.setText(
-                    f"{m.name} · {src} décalé de {m.peak_time * 1e3:.3f} ms et mis à l'échelle "
-                    f"({20 * np.log10(abs(g) + 1e-20):+.2f} dB{', polarité inversée' if g < 0 else ''}) · "
-                    f"résidu {rd:.1f} dB  (blanc : original · rouge : résidu)")
+                    f"{m.name} · {src} shifted by {m.peak_raw * 1e3:.3f} ms and scaled "
+                    f"({20 * np.log10(abs(g) + 1e-20):+.2f} dB{', polarity inverted' if g < 0 else ''}) · "
+                    f"residual {rd:.1f} dB  (white: {src} · red: residual)")
             else:
                 self.time_info.setText(
-                    f"{m.name} · {src} filtré par la réponse mesurée · résidu (bruit + distorsion) "
-                    f"{rd:.1f} dB sous la prise")
+                    f"{m.name} · {src} filtered by the measured response · residual (noise + distortion) "
+                    f"{rd:.1f} dB below the take")
 
-    # -- Différences
+    # -- Differences
     def draw_diff(self):
         A = self.A
         grid = A["grid"]
@@ -1295,21 +1636,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.p_sum.plot(grid, c.sum_before, pen=self._pen(target.color, 1.3))
             self.p_sum.plot(grid, c.sum_after, pen=self._pen(C["accent"], 1.8))
             self.p_sum.setTitle(
-                f"Somme {self.ref.name} + {target.name} — couleur : brute · "
-                f"<span style='color:{C['accent']}'>vert : corrigée</span> · pointillé : idéal (+6 dB)",
+                f"Sum {self.ref.name} + {target.name} — color: raw · "
+                f"<span style='color:{C['accent']}'>green: corrected</span> · dashed: ideal (+6 dB)",
                 color=C["muted"], size="9pt")
             self.sum_target = (target, c)
         else:
-            self.p_sum.setTitle("Choisis une prise comme référence pour voir la sommation",
+            self.p_sum.setTitle("Choose a take as reference to see the summation",
                                 color=C["faint"], size="9pt")
         self.diff_lines = self._cursor_lines([self.p_dmag, self.p_dph, self.p_sum])
         self.p_dmag.setXRange(math.log10(grid[0]), math.log10(grid[-1]), padding=0.01)
         self._fill_settings_table()
         lo, hi = A["band"]
-        ref = self.ref.name if self.ref else "le signal original"
+        ref = self.ref.name if self.ref else "the original signal"
         self.diff_readout.setText(
-            f"<span style='color:{C['muted']}'>Référence : {ref} · bande de calcul "
-            f"{short_hz(round(lo))}–{short_hz(round(hi))} Hz (zone teintée)</span>")
+            f"<span style='color:{C['muted']}'>Reference: {ref} · fit band "
+            f"{short_hz(round(lo))}–{short_hz(round(hi))} Hz (shaded area)</span>")
 
     def settings_rows(self):
         A = self.A
@@ -1318,25 +1659,25 @@ class MainWindow(QtWidgets.QMainWindow):
         rows = []
         for m in self.meas:
             if m is self.ref:
-                rows.append([m.name, "0", "0", "0", "—", "—", "—", "—", "—", "Référence"])
+                rows.append([m.name, "0", "0", "0", "—", "—", "—", "—", "—", "Reference"])
                 continue
             c = A["comps"][id(m)]
             tau_ms = c.tau * 1e3
             parts = []
             if abs(tau_ms) >= 0.0005:
-                parts.append(f"{'avancer' if tau_ms > 0 else 'retarder'} de {abs(tau_ms):.3f} ms "
-                             f"({abs(c.tau) * fs:.1f} éch.)")
+                parts.append(f"{'advance' if tau_ms > 0 else 'delay'} by {abs(tau_ms):.3f} ms "
+                             f"({abs(c.tau) * fs:.1f} samples)")
             if c.inverted:
-                parts.append("inverser la polarité")
+                parts.append("invert the polarity")
             if abs(c.rotation) >= 1:
-                parts.append(f"rotation de phase {-c.rotation:+.0f}°")
+                parts.append(f"phase rotation {-c.rotation:+.0f}°")
             if abs(c.gain_db) >= 0.1:
                 parts.append(f"gain {-c.gain_db:+.1f} dB")
-            corr = ", ".join(parts) or "aucune"
+            corr = ", ".join(parts) or "none"
             corr = corr[0].upper() + corr[1:]
             rows.append([
                 m.name, f"{tau_ms:+.3f}", f"{c.tau * fs:+.2f}", f"{c.tau * c_air * 100:+.2f}",
-                "inversée" if c.inverted else "normale", f"{nz(c.rotation):+.1f}", f"{nz(c.gain_db):+.2f}",
+                "inverted" if c.inverted else "normal", f"{nz(c.rotation):+.1f}", f"{nz(c.gain_db):+.2f}",
                 f"{c.resid_rms:.1f}° RMS", fmt_hz(c.notch_hz) if c.notch_hz else "—", corr])
         return rows
 
@@ -1351,13 +1692,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     it.setIcon(color_icon(m.color))
                 elif c < 9:
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if c == 4 and txt == "inversée":
+                if c == 4 and txt == "inverted":
                     it.setForeground(QtGui.QColor(C["warn"]))
                 if c == 7 and m is not self.ref:
                     if self.A["comps"][id(m)].resid_rms > 20:
                         it.setForeground(QtGui.QColor(C["warn"]))
-                        it.setToolTip("Retard + rotation n'expliquent pas tout : la différence "
-                                      "dépend de la fréquence (filtrage, réflexions, directivité).")
+                        it.setToolTip("Delay + rotation do not explain everything: the difference "
+                                      "depends on frequency (filtering, reflections, directivity).")
                 if c == 9 and m is not self.ref:
                     it.setForeground(QtGui.QColor(C["accent"]))
                     it.setToolTip(txt)
@@ -1369,7 +1710,7 @@ class MainWindow(QtWidgets.QMainWindow):
         hdr = [self.set_table.horizontalHeaderItem(i).text() for i in range(self.set_table.columnCount())]
         lines = ["\t".join(hdr)] + ["\t".join(r) for r in self.settings_rows()]
         QtWidgets.QApplication.clipboard().setText("\n".join(lines))
-        self.status("Réglages copiés dans le presse-papiers.")
+        self.status("Settings copied to the clipboard.")
 
     # -- Rotation
     def _rot_freqs(self):
@@ -1400,8 +1741,8 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 c = A["comps"][id(m)]
                 dmag, dph, tau = c.dmag, c.dphase(grid, mode), c.tau
-            # phase déroulée en fréquence (depuis le grave) : pas d'ambiguïté de
-            # tour entre deux angles, même quand le retard change beaucoup
+            # phase unwrapped over frequency (from the low end): no turn ambiguity
+            # between two angles, even when the delay changes a lot
             ph_at = [float(np.interp(math.log10(f), lg, dph)) for f in freqs]
             if not self.rot_unwrap.isChecked():
                 ph_at = [float(dsp.wrap_deg(v)) for v in ph_at]
@@ -1418,12 +1759,12 @@ class MainWindow(QtWidgets.QMainWindow):
         freqs, rows = self.rotation_data()
         self.rot_rows = (freqs, rows)
         if not rows:
-            self.rot_info.setText("Aucune prise visible n'a d'angle : saisis-le dans la colonne « Angle ».")
+            self.rot_info.setText("No visible take has an angle: enter it in the \"Angle\" column.")
             return
         ref = self.ref.name if self.ref else "l'original"
         tip = "" if self.A["dmode"] == "indiv" else \
-            " · astuce : Affichage › « Retard propre retiré » isole la rotation de phase du retard"
-        self.rot_info.setText(f"{len(rows)} prise(s) avec angle · écarts par rapport à {ref}{tip}")
+            " · tip: Display › \"Own delay removed\" isolates the phase rotation from the delay"
+        self.rot_info.setText(f"{len(rows)} take(s) with angle · deviations from {ref}{tip}")
         ang = np.array([r["angle"] for r in rows])
         leg = self.p_rph.addLegend(offset=(8, 8), brush=pg.mkBrush(C["panel"]), pen=pg.mkPen(C["border"]),
                                    labelTextColor=C["text"])
@@ -1441,9 +1782,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for p in (self.p_rph, self.p_rmag, self.p_rt):
             p.addItem(pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(C["faint"], style=Qt.DotLine)))
 
-        # carte angle × fréquence
+        # angle × frequency map
         grid = self.A["grid"]
-        self.p_rmap.setTitle("Δ phase selon fréquence et angle", color=C["muted"], size="9pt")
+        self.p_rmap.setTitle("Δ phase versus frequency and angle", color=C["muted"], size="9pt")
         if len(rows) >= 2:
             na = 181
             ag = np.linspace(ang.min(), ang.max(), na)
@@ -1469,9 +1810,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.rot_map = (ag, img, lx0, lx1)
         else:
             self.rot_map = None
-            self.p_rmap.setTitle("Au moins deux angles nécessaires", color=C["faint"], size="9pt")
+            self.p_rmap.setTitle("At least two angles needed", color=C["faint"], size="9pt")
 
-    # ------------------------------------------------------------ lecture souris
+    # ------------------------------------------------------------ mouse readout
     def _freq_hover(self, pos, plots, which):
         if not self.A:
             return
@@ -1505,7 +1846,7 @@ class MainWindow(QtWidgets.QMainWindow):
                              f"Δ {np.interp(x, lg, dmag):+.2f} dB&nbsp; {np.interp(x, lg, dph):+.1f}°")
             if self.sum_target:
                 t, c = self.sum_target
-                parts.append(f"somme {np.interp(x, lg, c.sum_before):+.1f} → "
+                parts.append(f"sum {np.interp(x, lg, c.sum_before):+.1f} → "
                              f"<span style='color:{C['accent']}'>{np.interp(x, lg, c.sum_after):+.1f} dB</span>")
             self.diff_readout.setText("&nbsp;&nbsp;&nbsp;".join(parts))
 
@@ -1515,7 +1856,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         pt = p.vb.mapSceneToView(pos)
         fs = self.A["fs"]
-        self.cursor_lab.setText(f"t = {pt.x():.4f} ms  ({pt.x() * 1e-3 * fs:.1f} éch.)   y = {pt.y():.4g}")
+        self.cursor_lab.setText(f"t = {pt.x():.4f} ms  ({pt.x() * 1e-3 * fs:.1f} samples)   y = {pt.y():.4g}")
 
     def _rot_hover(self, pos):
         for p in (self.p_rph, self.p_rmag, self.p_rt):
@@ -1548,55 +1889,55 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _need_data(self):
         if not self.A:
-            self.error("Rien à exporter", "Importe d'abord des prises.")
+            self.error("Nothing to export", "Import takes first.")
             return False
         return True
 
     def export_response_csv(self):
         if not self._need_data():
             return
-        path = self._ask_save("Exporter les courbes de réponse", "reponses.csv", "CSV (*.csv)")
+        path = self._ask_save("Export response curves", "responses.csv", "CSV (*.csv)")
         if not path:
             return
-        hdr, cols = ["Fréquence (Hz)"], [self.A["grid"]]
+        hdr, cols = ["Frequency (Hz)"], [self.A["grid"]]
         for m, mag, ph, gd in self.resp_data:
-            hdr += [f"{m.name} niveau (dB)", f"{m.name} phase (°)", f"{m.name} retard de groupe (ms)"]
+            hdr += [f"{m.name} level (dB)", f"{m.name} phase (°)", f"{m.name} group delay (ms)"]
             cols += [mag, ph, gd]
         self._write_csv(path, hdr, cols)
-        self.status(f"Exporté : {Path(path).name}")
+        self.status(f"Exported: {Path(path).name}")
 
     def export_diff_csv(self):
         if not self._need_data():
             return
-        path = self._ask_save("Exporter les différences", "differences.csv", "CSV (*.csv)")
+        path = self._ask_save("Export differences", "differences.csv", "CSV (*.csv)")
         if not path:
             return
-        hdr, cols = ["Fréquence (Hz)"], [self.A["grid"]]
+        hdr, cols = ["Frequency (Hz)"], [self.A["grid"]]
         for m, dmag, dph in self.diff_data:
-            hdr += [f"{m.name} Δ niveau (dB)", f"{m.name} Δ phase (°)"]
+            hdr += [f"{m.name} Δ level (dB)", f"{m.name} Δ phase (°)"]
             cols += [dmag, dph]
         if self.sum_target:
             t, c = self.sum_target
-            hdr += [f"Somme brute {t.name} (dB)", f"Somme corrigée {t.name} (dB)"]
+            hdr += [f"Raw sum {t.name} (dB)", f"Corrected sum {t.name} (dB)"]
             cols += [c.sum_before, c.sum_after]
         self._write_csv(path, hdr, cols)
-        self.status(f"Exporté : {Path(path).name}")
+        self.status(f"Exported: {Path(path).name}")
 
     def export_settings_csv(self):
         if not self._need_data():
             return
-        path = self._ask_save("Exporter les réglages", "reglages.csv", "CSV (*.csv)")
+        path = self._ask_save("Export settings", "settings.csv", "CSV (*.csv)")
         if not path:
             return
         hdr = [self.set_table.horizontalHeaderItem(i).text() for i in range(self.set_table.columnCount())]
         rows = self.settings_rows()
         self._write_csv(path, hdr, list(zip(*rows)) if rows else [[] for _ in hdr])
-        self.status(f"Exporté : {Path(path).name}")
+        self.status(f"Exported: {Path(path).name}")
 
     def export_eq(self):
         if not self._need_data():
             return
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Dossier pour les courbes de correction")
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the correction curves")
         if not folder:
             return
         n = 0
@@ -1604,36 +1945,36 @@ class MainWindow(QtWidgets.QMainWindow):
             corr = np.clip(-dmag, -20, 20)
             p = Path(folder) / f"{safe_name(m.name)}_correction_EQ.txt"
             with open(p, "w", encoding="utf-8") as fh:
-                fh.write(f"* PhaseLab - correction de niveau pour {m.name} vers "
-                         f"{self.ref.name if self.ref else 'original'}\n* Fréquence(Hz) Gain(dB)\n")
+                fh.write(f"* PhaseLab - level correction for {m.name} towards "
+                         f"{self.ref.name if self.ref else 'original'}\n* Frequency(Hz) Gain(dB)\n")
                 for f, g in zip(self.A["grid"][::3], corr[::3]):
                     fh.write(f"{f:.2f} {g:.3f}\n")
             n += 1
-        self.status(f"{n} courbe(s) de correction exportée(s) (format REW / égaliseurs à courbe).")
+        self.status(f"{n} correction curve(s) exported (REW / curve-based equalizer format).")
 
     def export_rotation_csv(self):
         if not self._need_data():
             return
         freqs, rows = self.rot_rows
         if not rows:
-            self.error("Rien à exporter", "Aucune prise visible n'a d'angle.")
+            self.error("Nothing to export", "No visible take has an angle.")
             return
-        path = self._ask_save("Exporter la rotation", "rotation.csv", "CSV (*.csv)")
+        path = self._ask_save("Export rotation", "rotation.csv", "CSV (*.csv)")
         if not path:
             return
-        hdr = ["Angle (°)", "Prise", "Δ temps (µs)"]
+        hdr = ["Angle (°)", "Take", "Δ time (µs)"]
         for f in freqs:
-            hdr += [f"Δ phase {short_hz(f)} Hz (°)", f"Δ niveau {short_hz(f)} Hz (dB)"]
+            hdr += [f"Δ phase {short_hz(f)} Hz (°)", f"Δ level {short_hz(f)} Hz (dB)"]
         cols = [[r["angle"] for r in rows], [r["m"].name for r in rows], [r["tau"] * 1e6 for r in rows]]
         for j in range(len(freqs)):
             cols += [[r["ph"][j] for r in rows], [r["mag"][j] for r in rows]]
         self._write_csv(path, hdr, cols)
-        self.status(f"Exporté : {Path(path).name}")
+        self.status(f"Exported: {Path(path).name}")
 
     def export_irs(self):
         if not self._need_data():
             return
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Dossier pour les réponses impulsionnelles")
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder for the impulse responses")
         if not folder:
             return
         vis = self.visible()
@@ -1642,62 +1983,87 @@ class MainWindow(QtWidgets.QMainWindow):
         scale = 0.9 / peak if peak > 0.9 else 1.0
         for m, s in zip(vis, segs):
             sf.write(str(Path(folder) / f"{safe_name(m.name)}_IR.wav"), s * scale, m.fs, subtype="FLOAT")
-        self.status(f"{len(vis)} réponse(s) impulsionnelle(s) exportée(s), temps 0 = début du signal"
-                    + (f", gain commun {20 * math.log10(scale):.1f} dB" if scale != 1 else ""))
+        self.status(f"{len(vis)} impulse response(s) exported, time 0 = start of the signal"
+                    + (f", common gain {20 * math.log10(scale):.1f} dB" if scale != 1 else ""))
 
     def export_png(self):
         w = self.tabs.currentWidget()
         name = self.tabs.tabText(self.tabs.currentIndex()).lower()
-        path = self._ask_save("Exporter l'image", f"phaselab_{name}.png", "PNG (*.png)")
+        path = self._ask_save("Export image", f"phaselab_{name}.png", "PNG (*.png)")
         if path:
             w.grab().save(path)
-            self.status(f"Image enregistrée : {Path(path).name}")
+            self.status(f"Image saved: {Path(path).name}")
 
-    # ----------------------------------------------------------------- projet
+    # ----------------------------------------------------------------- project
     def new_project(self):
         self.meas, self.ref, self.sel, self.signal, self.A = [], None, None, None, None
+        self.audio_files = []
         self.project_path = None
+        self._force_tabs = False
         self._spec_cache.clear()
         self._orig_cache.clear()
+        self.eq_tab.bands = []
         self._update_signal_card()
+        self.rta_tab.rebuild_table()
         self._refresh_lists()
+        self.setWindowTitle(APP)
 
     def save_project(self, ask=False):
-        if not self.signal:
-            self.error("Projet vide", "Rien à enregistrer pour l'instant.")
+        if not (self.signal or self.meas or self.audio_files):
+            self.error("Empty project", "Nothing to save yet.")
             return
         path = self.project_path
         if ask or not path:
-            path = self._ask_save("Enregistrer le projet", "mesures.phaselab", "Projet PhaseLab (*.phaselab)")
+            path = self._ask_save("Save project", "measurements.phaselab", "PhaseLab project (*.phaselab)")
             if not path:
                 return
+
+        def mdict(m):
+            d = dict(name=m.name, angle=m.angle, visible=m.visible, color=m.color,
+                     offset_ms=m.offset_ms, gain_db=m.gain_db, invert=m.invert)
+            if m.virtual and m.recipe is None:
+                folder = Path(path).with_name(Path(path).stem + "_traces")
+                folder.mkdir(exist_ok=True)
+                f = folder / f"{safe_name(m.name)}.wav"
+                sf.write(str(f), m.ir_raw.astype(np.float32), m.fs, subtype="FLOAT")
+                d.update(live=True, file=str(f), t0=m.t0_raw, f1=m.f1, f2=m.f2, averages=m.averages)
+            elif m.virtual:
+                d.update(virtual=True, recipe=m.recipe)
+            else:
+                d.update(path=m.path, channel=m.channel)
+            return d
+
         data = dict(
-            app=APP, version=VERSION, signal=self.signal.path,
-            loop_channel=self.loop_combo.currentData(),
+            app=APP, version=VERSION, signal=self.signal.path if self.signal else None,
+            loop_channel=self.loop_combo.currentData(), method=self.method_combo.currentData(),
+            nfft=self.nfft_combo.currentData(),
             ref=self.meas.index(self.ref) if self.ref in self.meas else -1,
             settings=dict(smoothing=self.smooth_combo.currentIndex(), wrap=self.wrap_combo.currentIndex(),
                           delay=self.delay_combo.currentIndex(), pre=self.pre_spin.value(),
                           post=self.post_spin.value(), fit_lo=self.fit_lo.value(),
                           fit_hi=self.fit_hi.value(), temp=self.temp_spin.value(),
                           rot_freqs=self.rot_freqs.text()),
-            measurements=[dict(path=m.path, channel=m.channel, name=m.name, angle=m.angle,
-                               visible=m.visible, color=m.color) for m in self.meas])
+            measurements=[mdict(m) for m in self.meas],
+            audio=[dict(path=a.path, visible=a.visible, color=a.color) for a in self.audio_files],
+            rta_target=self.rta_tab.target.currentText(),
+            eq=self.eq_tab.state())
         Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         self.project_path = path
         self.setWindowTitle(f"{APP} — {Path(path).stem}")
-        self.status(f"Projet enregistré : {Path(path).name}")
+        self.status(f"Project saved: {Path(path).name}")
 
     def open_project(self, path=None):
         if not path:
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Ouvrir un projet", "",
-                                                            "Projet PhaseLab (*.phaselab)")
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open a project", "",
+                                                            "PhaseLab project (*.phaselab)")
             if not path:
                 return
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
         except Exception as e:
-            self.error("Projet illisible", str(e))
+            self.error("Unreadable project", str(e))
             return
+        self.new_project()
         st = data.get("settings", {})
         for w, k in ((self.smooth_combo, "smoothing"), (self.wrap_combo, "wrap"), (self.delay_combo, "delay")):
             if k in st:
@@ -1707,40 +2073,86 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.setValue(st[k])
         if "rot_freqs" in st:
             self.rot_freqs.setText(st["rot_freqs"])
-        self.loop_combo.blockSignals(True)
-        self.loop_combo.setCurrentIndex(max(self.loop_combo.findData(data.get("loop_channel", 0)), 0))
-        self.loop_combo.blockSignals(False)
-        self.meas = []
-        if not data.get("signal") or not Path(data["signal"]).exists():
-            self.error("Signal introuvable", f"Le fichier du signal est introuvable :\n{data.get('signal')}")
-            return
-        self.load_signal(data["signal"])
+        for combo, k, default in ((self.loop_combo, "loop_channel", 0), (self.method_combo, "method", "auto"),
+                                  (self.nfft_combo, "nfft", 32768)):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(combo.findData(data.get(k, default)), 0))
+            combo.blockSignals(False)
+        missing = []
+        if data.get("signal"):
+            if Path(data["signal"]).exists():
+                self.load_signal(data["signal"])
+            else:
+                missing.append(data["signal"])
         for k in ("fit_lo", "fit_hi"):
             if k in st:
                 getattr(self, k).setValue(st[k])
         items = data.get("measurements", [])
-        paths = list(dict.fromkeys(it["path"] for it in items))
-        missing = [p for p in paths if not Path(p).exists()]
-        self.import_takes([p for p in paths if Path(p).exists()])
-        lookup = {(it["path"], it["channel"]): it for it in items}
+        real = [it for it in items if not it.get("virtual") and not it.get("live")]
+        paths = list(dict.fromkeys(it["path"] for it in real))
+        missing += [p for p in paths if not Path(p).exists()]
+        ok_paths = [p for p in paths if Path(p).exists()]
+        if ok_paths and self._can_measure():
+            self.import_takes(ok_paths)
+        lookup = {(it["path"], it["channel"]): it for it in real}
+        order = {}
+        for i, it in enumerate(items):
+            virt = it.get("virtual") or it.get("live")
+            order[("virtual", it["name"]) if virt else (it["path"], it["channel"])] = i
         kept = []
         for m in self.meas:
-            it = lookup.get((m.path, m.channel))
+            it = lookup.get(m.key)
             if it:
                 m.name, m.angle, m.visible = it["name"], it["angle"], it["visible"]
                 m.color = it.get("color") or m.color
+                m.offset_ms, m.gain_db, m.invert = it.get("offset_ms", 0), it.get("gain_db", 0), it.get("invert", False)
                 kept.append(m)
-        order = {(it["path"], it["channel"]): i for i, it in enumerate(items)}
-        self.meas = sorted(kept, key=lambda m: order[(m.path, m.channel)])
+        for it in items:
+            if it.get("live"):
+                try:
+                    ir, fs_ = sf.read(it["file"], dtype="float64")
+                except Exception:
+                    missing.append(it.get("file", it["name"]))
+                    continue
+                nm = dsp.Measurement(it["name"], fs_, ir, it["t0"], it["f1"], it["f2"], method="live",
+                                     averages=it.get("averages", 1))
+                nm.virtual = True
+                nm.color, nm.visible, nm.angle = it.get("color"), it["visible"], it.get("angle")
+                nm.offset_ms, nm.gain_db, nm.invert = it.get("offset_ms", 0), it.get("gain_db", 0), it.get("invert", False)
+                kept.append(nm)
+            elif it.get("virtual"):
+                try:
+                    srcs = [next(m for m in kept if list(m.key) == list(k)) for k in it["recipe"]["sources"]]
+                    nm = dsp.combine(srcs, it["recipe"]["op"], it["name"])
+                except Exception:
+                    continue
+                nm.color, nm.visible, nm.angle = it.get("color"), it["visible"], it.get("angle")
+                nm.offset_ms, nm.gain_db, nm.invert = it.get("offset_ms", 0), it.get("gain_db", 0), it.get("invert", False)
+                kept.append(nm)
+        self.meas = sorted(kept, key=lambda m: order.get(m.key, 1e9))
         r = data.get("ref", -1)
         self.ref = self.meas[r] if 0 <= r < len(self.meas) else None
+        self._spec_cache.clear()
+        afiles = [a for a in data.get("audio", []) if Path(a["path"]).exists()]
+        missing += [a["path"] for a in data.get("audio", []) if not Path(a["path"]).exists()]
+        if afiles:
+            self.rta_tab.add_files([a["path"] for a in afiles])
+            for af, a in zip(self.audio_files, afiles):
+                af.visible, af.color = a.get("visible", True), a.get("color") or af.color
+            self.rta_tab.rebuild_table()
+        if data.get("rta_target"):
+            i = self.rta_tab.target.findText(data["rta_target"])
+            if i >= 0:
+                self.rta_tab.target.setCurrentIndex(i)
         self.project_path = path
         self.setWindowTitle(f"{APP} — {Path(path).stem}")
         self._refresh_lists()
+        if data.get("eq"):
+            self.eq_tab.load_state(data["eq"])
         if missing:
-            self.error("Prises introuvables", "\n".join(missing))
+            self.error("Missing files", "\n".join(missing))
 
-    # ----------------------------------------------------------------- divers
+    # ----------------------------------------------------------------- misc
     def show_guide(self):
         GuideDialog(self).exec()
 

@@ -1,0 +1,18 @@
+{
+  "kind": "sweep",
+  "fs": 48000,
+  "duration": 4.144653167389282,
+  "f1": 20.0,
+  "f2": 20000.0,
+  "level_db": -6.0,
+  "pre_silence": 0.5,
+  "post_silence": 2.0,
+  "subtype": "PCM_24",
+  "seed": 1,
+  "period_pow": 17,
+  "repeats": 8,
+  "sine_freq": 1000.0,
+  "samples": 318943,
+  "pre_samples": 24000,
+  "phaselab_signal": 1
+}

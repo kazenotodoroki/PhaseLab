@@ -1,22 +1,27 @@
 """
-PhaseLab - moteur d'analyse.
+PhaseLab - analysis engine.
 
-Méthodologie (celle des boîtes à outils de mesure acoustique sous MATLAB,
-p. ex. ITA-Toolbox / scripts Farina-Novak) :
+Methodology (that of MATLAB acoustic measurement toolboxes, e.g. ITA-Toolbox /
+Farina-Novak scripts, and of dual-channel analyzers such as Open Sound Meter /
+Smaart):
 
-1. Excitation : sweep exponentiel synchronisé (Novak 2015) ou bruit à bande
-   limitée, généré ici pour que l'analyse connaisse exactement le signal joué.
-2. Déconvolution : division spectrale régularisée (inversion de Kirkeby).
-   Avec un sweep, les produits de distorsion harmonique tombent en temps
-   négatif et sont éliminés automatiquement.
-3. Repère temporel absolu : le temps 0 est le début du fichier du signal
-   (ou le canal de boucle si un loopback est enregistré).
-4. Fenêtrage de la réponse impulsionnelle autour de son pic (demi-Hann).
-5. Lissage complexe par fraction d'octave après retrait du retard propre,
-   pour que la phase reste exploitable.
-6. Comparaison par spectre croisé : différence de niveau, de phase, et
-   estimation conjointe retard + rotation de phase constante (GCC pondéré
-   1/f, enveloppe analytique, interpolation sous-échantillon).
+1. Excitation generated here (synchronized sweep, periodic sweeps, noises,
+   MLS…) so that the analysis knows exactly what was played.
+2. Three measurement methods:
+   - sweep: regularized spectral division (Kirkeby inversion); harmonic
+     distortion falls into negative time and is discarded;
+   - periodic: synchronous averaging of the periods, then exact circular
+     deconvolution (periodic noise, MLS, repeated sweeps);
+   - dual channel: averaged transfer function H1 = Sxy / Sxx (Welch) with
+     coherence, after automatic delay search. Works with any signal (noise,
+     music) as long as the reference is available (loopback or signal
+     file).
+3. Absolute time reference: time 0 is the start of the signal file
+   (or the loopback channel if one was recorded).
+4. Windowing of the impulse response around its peak (half-Hann).
+5. Complex fractional-octave smoothing after removing the own delay.
+6. Cross-spectrum comparison: level and phase difference, and joint
+   estimation of delay + constant phase rotation.
 """
 from __future__ import annotations
 
@@ -28,18 +33,29 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import fftconvolve, hilbert
+from scipy.signal import fftconvolve, hilbert, max_len_seq
 
 KIND_LABELS = {
-    "sweep": "Sweep logarithmique",
-    "pink": "Bruit rose",
-    "white": "Bruit blanc",
-    "impulse": "Impulsion",
+    "sweep": "Log sweep",
+    "sweep_rep": "Repeated sweeps (periodic)",
+    "pink": "Pink noise",
+    "white": "White noise",
+    "brown": "Brown noise",
+    "pink_per": "Periodic pink noise",
+    "white_per": "Periodic white noise",
+    "mls": "MLS (pseudo-random)",
+    "sine": "Sine",
+    "impulse": "Impulse",
 }
-SUBTYPES = {"PCM_24": "24 bits", "FLOAT": "32 bits flottant", "PCM_16": "16 bits"}
+PERIODIC_KINDS = {"sweep_rep", "pink_per", "white_per", "mls"}
+DECONV_KINDS = {"sweep", "impulse", "inconnu"}
+METHOD_LABELS = {"auto": "Automatic", "sweep": "Deconvolution (sweep)",
+                 "periodic": "Synchronous average (periodic)", "dual": "Dual channel (any signal)",
+                 "combined": "Combination", "live": "Real time (dual channel)"}
+SUBTYPES = {"PCM_24": "24 bits", "FLOAT": "32-bit float", "PCM_16": "16 bits"}
 
 
-# ----------------------------------------------------------------- utilitaires
+# ----------------------------------------------------------------- utilities
 def next_pow2(n: int) -> int:
     return 1 << max(0, int(math.ceil(math.log2(max(int(n), 1)))))
 
@@ -53,7 +69,7 @@ def wrap_deg(a):
 
 
 def parse_angle(name: str):
-    """Détecte un angle dans un nom de fichier : 'snare_45deg', 'mic -30°'."""
+    """Detects an angle in a file name: 'snare_45deg', 'mic -30°'."""
     m = re.search(r"(-?\d+(?:[.,]\d+)?)\s*(?:°|deg|degr[ée]s?)", name, re.I)
     if m:
         return float(m.group(1).replace(",", "."))
@@ -61,7 +77,7 @@ def parse_angle(name: str):
 
 
 def band_weight(f, f1, f2, width_oct=0.5):
-    """1 dans la bande, transition en cosinus sur une demi-octave, 0 au-delà."""
+    """1 inside the band, cosine transition over half an octave, 0 beyond."""
     f = np.maximum(np.asarray(f, dtype=float), 1e-9)
     lo = np.log2(f / f1)
     hi = np.log2(f / f2)
@@ -84,7 +100,15 @@ def _fade(n, n_in, n_out):
     return w
 
 
-# ------------------------------------------------------------ signaux de test
+def frac_shift(x, delay_s, fs, n_out=None):
+    """Exact fractional delay (frequency domain)."""
+    n_out = n_out or len(x)
+    N = next_pow2(max(len(x), n_out) + int(abs(delay_s) * fs) + 64)
+    f = np.fft.rfftfreq(N, 1 / fs)
+    return np.fft.irfft(np.fft.rfft(x, N) * np.exp(-2j * np.pi * f * delay_s), N)[:n_out]
+
+
+# ------------------------------------------------------------ test signals
 @dataclass
 class SignalSpec:
     kind: str = "sweep"
@@ -97,6 +121,30 @@ class SignalSpec:
     post_silence: float = 2.0
     subtype: str = "PCM_24"
     seed: int = 1
+    period_pow: int = 17          # period = 2^n samples (periodic signals)
+    repeats: int = 8              # number of periods
+    sine_freq: float = 1000.0
+
+
+def _shaped_noise(n, fs, f1, f2, slope, rng, flat_mag=False):
+    """Band-limited noise; slope 0 = white, 1 = pink (-3 dB/oct), 2 = brown."""
+    f = np.fft.rfftfreq(n, 1 / fs)
+    if flat_mag:   # periodic: exact magnitude, random phase
+        X = np.exp(2j * np.pi * rng.random(len(f)))
+    else:
+        X = np.fft.rfft(rng.standard_normal(n))
+    X *= band_weight(f, f1, f2, 0.25)
+    if slope:
+        X /= np.maximum(f, f1) ** (slope / 2)
+    X[0] = 0
+    return np.fft.irfft(X, n)
+
+
+def _exp_sweep(n, fs, f1, f2):
+    T = n / fs
+    t = np.arange(n) / fs
+    k = math.log(f2 / f1)
+    return np.sin(2 * np.pi * f1 * T / k * (np.exp(t / T * k) - 1))
 
 
 def generate_signal(spec: SignalSpec):
@@ -105,10 +153,12 @@ def generate_signal(spec: SignalSpec):
     f2 = min(float(spec.f2), 0.499 * fs)
     rng = np.random.default_rng(spec.seed)
     dur = float(spec.duration)
+    kind = spec.kind
+    period = None
 
-    if spec.kind == "sweep":
-        # Sweep exponentiel synchronisé (Novak) : la phase des harmoniques est
-        # cohérente et le signal commence/finit proprement.
+    if kind == "sweep":
+        # Synchronized exponential sweep (Novak): harmonic phases are
+        # coherent and the signal starts/ends cleanly.
         L = max(round(f1 * dur / math.log(f2 / f1)), 1) / f1
         dur = L * math.log(f2 / f1)
         t = np.arange(int(round(dur * fs))) / fs
@@ -116,21 +166,40 @@ def generate_signal(spec: SignalSpec):
         n_in = int(fs * min(0.1 * dur, 2.0 / f1))
         n_out = int(fs * min(0.005, 0.02 * dur))
         core *= _fade(len(core), n_in, n_out)
-    elif spec.kind in ("pink", "white"):
+    elif kind in ("pink", "white", "brown"):
         n = int(round(dur * fs))
-        X = np.fft.rfft(rng.standard_normal(n))
-        f = np.fft.rfftfreq(n, 1 / fs)
-        X *= band_weight(f, f1, f2, 0.25)
-        if spec.kind == "pink":
-            X /= np.sqrt(np.maximum(f, f1))
-        core = np.fft.irfft(X, n)
+        slope = {"white": 0, "pink": 1, "brown": 2}[kind]
+        core = _shaped_noise(n, fs, f1, f2, slope, rng)
         core *= _fade(n, int(0.01 * fs), int(0.01 * fs))
-    elif spec.kind == "impulse":
+    elif kind in PERIODIC_KINDS:
+        if kind == "mls":
+            nbits = int(spec.period_pow)
+            one = max_len_seq(nbits)[0].astype(float) * 2 - 1
+            f1, f2 = max(fs / len(one), 1.0), 0.499 * fs
+        else:
+            P = 1 << int(spec.period_pow)
+            if kind == "sweep_rep":
+                ns = int(P * 0.9)
+                sw = _exp_sweep(ns, fs, f1, f2)
+                sw *= _fade(ns, int(fs * min(0.05, 2.0 / f1)), int(fs * 0.003))
+                one = np.concatenate([sw, np.zeros(P - ns)])
+            else:
+                one = _shaped_noise(P, fs, f1, f2, 1 if kind == "pink_per" else 0, rng, flat_mag=True)
+        period = len(one)
+        reps = max(int(spec.repeats), 2)
+        core = np.tile(one, reps)
+        dur = len(core) / fs
+    elif kind == "sine":
+        n = int(round(dur * fs))
+        core = np.sin(2 * np.pi * spec.sine_freq * np.arange(n) / fs)
+        core *= _fade(n, int(0.02 * fs), int(0.02 * fs))
+        f1 = f2 = float(spec.sine_freq)
+    elif kind == "impulse":
         n = max(int(round(dur * fs)), 1)
         core = np.zeros(n)
         core[0] = 1.0
     else:
-        raise ValueError(f"Type de signal inconnu : {spec.kind}")
+        raise ValueError(f"Unknown signal type: {kind}")
 
     core *= 10 ** (spec.level_db / 20) / np.max(np.abs(core))
     pre = int(round(spec.pre_silence * fs))
@@ -139,6 +208,8 @@ def generate_signal(spec: SignalSpec):
     meta = asdict(spec)
     meta.update(dict(f1=f1, f2=f2, duration=dur, samples=len(x),
                      pre_samples=pre, phaselab_signal=1))
+    if period:
+        meta.update(period=period, repeats=max(int(spec.repeats), 2))
     return x, meta
 
 
@@ -147,7 +218,7 @@ def sidecar_path(path) -> Path:
 
 
 class TestSignal:
-    """Le signal de référence, tel qu'il est joué dans Reaper."""
+    """The reference signal, as played in Reaper."""
 
     def __init__(self, data, fs, meta, path=None):
         self.data = np.asarray(data, dtype=float)
@@ -160,8 +231,12 @@ class TestSignal:
         return self.meta.get("kind", "inconnu")
 
     @property
+    def periodic(self):
+        return self.kind in PERIODIC_KINDS and "period" in self.meta
+
+    @property
     def label(self):
-        return KIND_LABELS.get(self.kind, "Signal externe")
+        return KIND_LABELS.get(self.kind, "External signal")
 
     @property
     def f1(self):
@@ -173,7 +248,7 @@ class TestSignal:
 
     @property
     def name(self):
-        return Path(self.path).name if self.path else "(non enregistré)"
+        return Path(self.path).name if self.path else "(not saved)"
 
     def save(self, path):
         path = Path(path)
@@ -196,12 +271,12 @@ class TestSignal:
         return cls(data[:, 0], fs, meta, path)
 
 
-# -------------------------------------------------------------- déconvolution
+# ------------------------------------------------------------ three methods
 def deconvolve(y, x, fs, f1, f2, keep_s=3.0, neg_s=0.05):
-    """Réponse impulsionnelle h telle que y = x * h (inversion de Kirkeby).
+    """Impulse response h such that y = x * h (Kirkeby inversion).
 
-    Renvoie (ir, t0) : t0 est le temps (s) du premier échantillon de ir
-    (négatif : on garde un peu de temps négatif pour les retards < 0).
+    Returns (ir, t0): t0 is the time (s) of the first sample of ir
+    (negative: a little negative time is kept for delays < 0).
     """
     N = next_pow2(len(y) + len(x))
     X = np.fft.rfft(x, N)
@@ -219,8 +294,92 @@ def deconvolve(y, x, fs, f1, f2, keep_s=3.0, neg_s=0.05):
     return ir, -nneg / fs
 
 
+def _regularize(H_num, P, f, f1, f2):
+    w = band_weight(f, f1, f2)
+    inband = w > 0.99
+    pmax = P[inband].max() if inband.any() else P.max()
+    return H_num / (P + pmax * (1e-8 + 1e-2 * (1 - w)))
+
+
+def measure_periodic(y, xsig, meta, fs, f1, f2, loop=None):
+    """Synchronous averaging then circular deconvolution (periodic signal).
+
+    The 1st period is ignored (room transient)."""
+    P = int(meta["period"])
+    R = int(meta.get("repeats", 2))
+    pre = int(meta.get("pre_samples", 0))
+    starts = [pre + k * P for k in range(1 if R > 1 else 0, R)]
+    starts = [s for s in starts if s + P <= len(y)]
+    if not starts:
+        raise ValueError("Take too short for the periodic signal.")
+    f = np.fft.rfftfreq(P, 1 / fs)
+    Ys = np.array([np.fft.rfft(y[s:s + P]) for s in starts])
+    if loop is not None:
+        Xs = np.array([np.fft.rfft(loop[s:s + P]) for s in starts])
+    else:
+        Xs = np.tile(np.fft.rfft(xsig[pre:pre + P]), (len(starts), 1))
+    Sxy = np.mean(Ys * np.conj(Xs), axis=0)
+    Sxx = np.mean(np.abs(Xs) ** 2, axis=0)
+    Syy = np.mean(np.abs(Ys) ** 2, axis=0)
+    H = _regularize(Sxy, Sxx, f, f1, f2)
+    coh = None
+    if len(starts) >= 2:
+        coh = np.clip(np.abs(Sxy) ** 2 / (Sxx * Syy + 1e-30), 0, 1)
+    h = np.fft.irfft(H, P)
+    nneg = min(int(0.05 * fs), P // 8)
+    ir = np.concatenate([h[P - nneg:], h[:P - nneg]])
+    return ir, -nneg / fs, f, coh, len(starts)
+
+
+def find_delay(y, x, fs, f1=20.0, f2=20000.0, max_s=2.0, max_len_s=60.0):
+    """Coarse delay of y relative to x (GCC-PHAT), in samples."""
+    n = min(len(x), len(y), int(max_len_s * fs))
+    maxlag = int(max_s * fs)
+    N = next_pow2(n + maxlag)
+    X = np.fft.rfft(x[:n], N)
+    Y = np.fft.rfft(y[:min(len(y), n + maxlag)], N)
+    f = np.fft.rfftfreq(N, 1 / fs)
+    C = Y * np.conj(X)
+    C = C / (np.abs(C) + 1e-20) * band_weight(f, max(f1, 20.0), min(f2, 0.45 * fs))
+    r = np.fft.irfft(C, N)
+    cand = np.concatenate([np.arange(0, maxlag + 1), np.arange(N - maxlag, N)])
+    j = int(cand[np.argmax(np.abs(r[cand]))])
+    return j if j <= N // 2 else j - N
+
+
+def measure_dual(y, x, fs, f1, f2, nfft=32768, overlap=0.75):
+    """Dual-channel transfer function (H1, Welch) + coherence, any signal."""
+    d = find_delay(y, x, fs, f1, f2)
+    if d >= 0:
+        ya, xa = y[d:], x
+    else:
+        ya, xa = y, x[-d:]
+    L = min(len(ya), len(xa))
+    ya, xa = ya[:L], xa[:L]
+    nfft = int(min(nfft, 1 << int(math.floor(math.log2(max(L, 256))))))
+    hop = max(int(nfft * (1 - overlap)), 1)
+    win = np.hanning(nfft)
+    f = np.fft.rfftfreq(nfft, 1 / fs)
+    Sxx = np.zeros(len(f)); Syy = np.zeros(len(f)); Sxy = np.zeros(len(f), complex)
+    starts = np.arange(0, L - nfft + 1, hop)
+    for i in range(0, len(starts), 64):
+        idx = starts[i:i + 64, None] + np.arange(nfft)[None, :]
+        X = np.fft.rfft(xa[idx] * win, axis=1)
+        Y = np.fft.rfft(ya[idx] * win, axis=1)
+        Sxx += np.sum(np.abs(X) ** 2, axis=0)
+        Syy += np.sum(np.abs(Y) ** 2, axis=0)
+        Sxy += np.sum(Y * np.conj(X), axis=0)
+    H = _regularize(Sxy, Sxx, f, f1, f2)
+    coh = np.clip(np.abs(Sxy) ** 2 / (Sxx * Syy + 1e-30), 0, 1)
+    h = np.fft.irfft(H, nfft)
+    nneg = nfft // 8
+    ir = np.concatenate([h[nfft - nneg:], h[:nfft - nneg]])
+    return ir, (d - nneg) / fs, f, coh, len(starts)
+
+
+# ------------------------------------------------------------ IR analysis
 def _sinc_peak(ir, k):
-    """Position fractionnaire du maximum de |ir| par interpolation sinc."""
+    """Fractional position of the maximum of |ir| by sinc interpolation."""
     lo, hi = max(k - 32, 0), min(k + 33, len(ir))
     n = np.arange(lo, hi)
     seg = ir[lo:hi]
@@ -255,59 +414,310 @@ def analyze_ir(ir, t0, fs):
 
 
 class Measurement:
-    """Une prise (un canal d'un fichier WAV) et sa réponse impulsionnelle."""
+    """A measurement: impulse response + adjustments (delay, gain, polarity).
 
-    def __init__(self, name, y, xref, fs, f1, f2, path=None, channel=0,
-                 loopback=False):
+    The *_raw fields are the raw measurement; ir, t0, peak_time… include the
+    user's adjustments, like Open Sound Meter's stored traces.
+    """
+
+    def __init__(self, name, fs, ir, t0, f1, f2, y=None, xref=None, path=None, channel=0,
+                 loopback=False, method="sweep", coh_f=None, coh=None, averages=1):
         self.name = name
-        self.y = np.asarray(y, dtype=float)
-        self.xref = xref
         self.fs = int(fs)
+        self.ir_raw = np.asarray(ir, dtype=float)
+        self.t0_raw = float(t0)
+        self.f1, self.f2 = float(f1), float(f2)
+        self.y = None if y is None else np.asarray(y, dtype=float)
+        self.xref = xref
         self.path = str(path) if path else None
         self.channel = channel
         self.loopback = loopback
+        self.method = method
+        self.coh_f, self.coh = coh_f, coh
+        self.averages = averages
         self.angle = parse_angle(name)
         self.visible = True
         self.color = None
-        self.ir, self.t0 = deconvolve(self.y, xref, fs, f1, f2)
-        self.peak_time, self.polarity, self.onset_time, self.snr_db = analyze_ir(
-            self.ir, self.t0, self.fs)
-        self._env = None
+        self.virtual = False
+        self.recipe = None
+        self.offset_ms = 0.0
+        self.gain_db = 0.0
+        self.invert = False
+        self.peak_raw, self.pol_raw, self.onset_raw, self.snr_db = analyze_ir(self.ir_raw, self.t0_raw, self.fs)
+        self._env_raw = None
+        self._ir_cache = None
+
+    # --- adjustments
+    @property
+    def adj_key(self):
+        return (round(self.offset_ms, 9), round(self.gain_db, 6), bool(self.invert))
+
+    @property
+    def g(self):
+        return (-1.0 if self.invert else 1.0) * 10 ** (self.gain_db / 20)
+
+    @property
+    def adjusted(self):
+        return self.adj_key != (0.0, 0.0, False)
+
+    def reset_adjust(self):
+        self.offset_ms, self.gain_db, self.invert = 0.0, 0.0, False
+
+    @property
+    def ir(self):
+        if self._ir_cache is None or self._ir_cache[0] != self.adj_key:
+            self._ir_cache = (self.adj_key, self.ir_raw * self.g)
+        return self._ir_cache[1]
+
+    @property
+    def t0(self):
+        return self.t0_raw + self.offset_ms * 1e-3
+
+    @property
+    def peak_time(self):
+        return self.peak_raw + self.offset_ms * 1e-3
+
+    @property
+    def onset_time(self):
+        return self.onset_raw + self.offset_ms * 1e-3
+
+    @property
+    def polarity(self):
+        return -self.pol_raw if self.invert else self.pol_raw
 
     @property
     def env(self):
-        if self._env is None:
-            self._env = np.abs(hilbert(self.ir))
-        return self._env
+        if self._env_raw is None:
+            self._env_raw = np.abs(hilbert(self.ir_raw))
+        return self._env_raw * abs(self.g)
+
+    @property
+    def key(self):
+        return (self.path, self.channel) if not self.virtual else ("virtual", self.name)
 
 
-def load_takes(path, signal: TestSignal, loop_channel=0):
-    """Charge un WAV de prises. loop_channel : 0 = aucun, sinon n° (1..n)."""
+def _contains(loop, sig, fs):
+    """Does the loopback contain the test signal? (normalized correlation)"""
+    try:
+        d = find_delay(loop, sig, fs, max_len_s=20.0)
+    except Exception:
+        return False
+    a = loop[d:] if d >= 0 else loop
+    b = sig if d >= 0 else sig[-d:]
+    n = min(len(a), len(b), int(20 * fs))
+    a, b = a[:n], b[:n]
+    den = math.sqrt(float(a @ a) * float(b @ b))
+    return den > 0 and abs(float(a @ b)) / den > 0.3
+
+
+def load_takes(path, signal: TestSignal | None, loop_channel=0, method="auto", nfft=32768):
+    """Loads a WAV of takes. loop_channel: 0 = none, else channel number (1..n)."""
     data, fs = sf.read(str(path), always_2d=True, dtype="float64")
-    if fs != signal.fs:
-        raise ValueError(
-            f"{Path(path).name} : {fs} Hz, alors que le signal est à {signal.fs} Hz.")
+    if signal is not None and fs != signal.fs:
+        raise ValueError(f"{Path(path).name}: {fs} Hz, but the signal is at {signal.fs} Hz.")
     nch = data.shape[1]
-    xref, loop = signal.data, False
     chans = list(range(nch))
+    loop = None
     if loop_channel and 1 <= loop_channel <= nch and nch > 1:
-        xref, loop = data[:, loop_channel - 1].copy(), True
+        loop = data[:, loop_channel - 1].copy()
         chans.remove(loop_channel - 1)
+    xref = loop if loop is not None else (signal.data if signal is not None else None)
+    if xref is None:
+        raise ValueError("no reference: load the test signal, or set the loopback "
+                         "(reference) channel for a dual-channel measurement.")
+    if method == "auto" and loop is not None and signal is not None and not _contains(loop, signal.data, fs):
+        method = "dual"          # something other than the signal was played (music…): dual channel
+    if method == "auto":
+        if signal is not None and signal.periodic:
+            method = "periodic"
+        elif signal is not None and signal.kind in DECONV_KINDS:
+            method = "sweep"
+        else:
+            method = "dual"
+    if method == "periodic" and (signal is None or not signal.periodic):
+        raise ValueError("synchronous averaging needs a periodic signal generated by PhaseLab.")
+    f1 = signal.f1 if signal is not None else 20.0
+    f2 = signal.f2 if signal is not None else min(20000.0, 0.45 * fs)
+    if signal is not None and signal.kind == "sine":
+        f1, f2 = 20.0, min(20000.0, 0.45 * fs)
+    if method == "dual":
+        f1 = max(f1, 2.0 * fs / nfft)
     stem = Path(path).stem
     out = []
     for c in chans:
+        y = data[:, c]
+        coh_f = coh = None
+        avg = 1
+        if method == "sweep":
+            ir, t0 = deconvolve(y, xref, fs, f1, f2)
+        elif method == "periodic":
+            ir, t0, coh_f, coh, avg = measure_periodic(y, signal.data, signal.meta, fs, f1, f2, loop)
+        else:
+            ir, t0, coh_f, coh, avg = measure_dual(y, xref, fs, f1, f2, nfft)
         name = stem if len(chans) == 1 else f"{stem} · c{c + 1}"
-        out.append(Measurement(name, data[:, c], xref, fs, signal.f1, signal.f2,
-                               path, c, loop))
+        out.append(Measurement(name, fs, ir, t0, f1, f2, y, xref, path, c, loop is not None,
+                               method, coh_f, coh, avg))
     return out
 
 
-# ------------------------------------------------------- spectres et lissage
+# ------------------------------------------------------- combined measurements
+def min_phase_from_power(P, N):
+    """Minimum-phase response with power spectrum P (real cepstrum)."""
+    logm = 0.5 * np.log(np.maximum(P, 1e-20))
+    c = np.fft.irfft(logm, N)
+    w = np.zeros(N)
+    w[0] = 1
+    w[1:N // 2] = 2
+    w[N // 2] = 1
+    return np.fft.irfft(np.exp(np.fft.rfft(c * w, N)), N)
+
+
+COMBINE_OPS = {"vector": "Vector average (complex)", "power": "Power average (minimum phase)",
+               "sum": "Sum (A + B + …)", "diff": "Difference (A − B)"}
+
+
+def combine(ms: list[Measurement], op: str, name: str) -> Measurement:
+    fs = ms[0].fs
+    if any(m.fs != fs for m in ms):
+        raise ValueError("different sample rates")
+    if op == "diff" and len(ms) != 2:
+        raise ValueError("the difference needs exactly two measurements")
+    t_start = min(m.t0 for m in ms)
+    t_end = max(m.t0 + len(m.ir) / fs for m in ms)
+    N = next_pow2(int((t_end - t_start) * fs) + 64)
+    f = np.fft.rfftfreq(N, 1 / fs)
+    Hs = []
+    for m in ms:
+        s = (m.t0 - t_start) * fs
+        k = int(math.floor(s))
+        buf = np.zeros(N)
+        n = min(len(m.ir), N - k)
+        buf[k:k + n] = m.ir[:n]
+        Hs.append(np.fft.rfft(buf) * np.exp(-2j * np.pi * f * (s - k) / fs))
+    Hs = np.array(Hs)
+    t0 = t_start
+    if op == "vector":
+        H = Hs.mean(axis=0)
+    elif op == "sum":
+        H = Hs.sum(axis=0)
+    elif op == "diff":
+        H = Hs[0] - Hs[1]
+    elif op == "power":
+        h = min_phase_from_power(np.mean(np.abs(Hs) ** 2, axis=0), N)
+        kp = int(np.argmax(np.abs(h)))
+        t0 = float(np.mean([m.peak_time for m in ms])) - kp / fs
+        H = np.fft.rfft(h)
+    else:
+        raise ValueError(op)
+    ir = np.fft.irfft(H, N)
+    out = Measurement(name, fs, ir, t0, max(m.f1 for m in ms), min(m.f2 for m in ms), method="combined")
+    out.virtual = True
+    out.recipe = dict(op=op, sources=[list(m.key) for m in ms])
+    return out
+
+
+# ------------------------------------------------------------- onset
+def onset_info(x, fs, t0=0.0, thr_db=-20.0, anchor=None, search_ms=10.0):
+    """Analysis of the start of a waveform.
+
+    anchor: index of the main peak (IR); otherwise the first significant
+    event above the noise floor is detected.
+    Returns dict(onset, motion, peak, rise, polarity) in seconds (t0 included).
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < 8 or not np.any(x):
+        return None
+    if anchor is None:
+        blk = max(int(0.005 * fs), 8)
+        nb = n // blk
+        if nb >= 4:
+            rms = np.sqrt(np.mean(x[:nb * blk].reshape(nb, blk) ** 2, axis=1))
+            noise = np.percentile(rms, 10)
+        else:
+            noise = 0.0
+        gpk = np.max(np.abs(x))
+        thr0 = max(noise * 10 ** (15 / 20), gpk * 10 ** (-45 / 20))
+        above = np.nonzero(np.abs(x) > thr0)[0]
+        if not len(above):
+            return None
+        i0 = int(above[0])
+        i1 = min(i0 + int(search_ms * 1e-3 * fs), n)
+        anchor = i0 + int(np.argmax(np.abs(x[i0:i1])))
+    lo = max(anchor - int(0.03 * fs), 0)
+    hi = min(anchor + int(0.005 * fs), n)
+    seg = x[lo:hi]
+    a = np.abs(seg)
+    k = anchor - lo
+    lp = a[k]
+    if lp <= 0:
+        return None
+    # Work on the samples themselves (not on the Hilbert envelope, which is
+    # non-causal and "smears" before the true start).
+    thr = lp * 10 ** (thr_db / 20)
+    j = int(np.nonzero(a[:k + 1] >= thr)[0][0])
+    if j > 0 and a[j] != a[j - 1]:
+        onset = j - 1 + (thr - a[j - 1]) / (a[j] - a[j - 1])
+    else:
+        onset = float(j)
+    # first motion: go back from the threshold to the previous zero crossing,
+    # or down to 6 dB below the threshold for
+    # slow onsets (sub) that never cross zero.
+    sgn = np.sign(seg[j]) or 1.0
+    quiet = thr * 0.5
+    m = j - 1
+    while m > 0 and np.sign(seg[m]) == sgn and a[m] > quiet:
+        m -= 1
+    if m > 0 and np.sign(seg[m]) == sgn:
+        # stopped on the noise level: accept the zero crossing if it is close
+        lim, m2 = max(2 * (j - m), 2), m
+        while m2 > 0 and np.sign(seg[m2]) == sgn and (m - m2) < lim:
+            m2 -= 1
+        if np.sign(seg[m2]) != sgn:
+            m = m2
+    if m >= 0 and np.sign(seg[m]) != sgn and seg[m + 1] != seg[m]:
+        motion = m + seg[m] / (seg[m] - seg[m + 1])
+    elif m >= 0 and a[m + 1] != a[m]:
+        motion = m + (quiet - a[m]) / (a[m + 1] - a[m])
+    else:
+        motion = float(max(m, 0))
+    # polarity: first lobe reaching half of the peak
+    big = np.nonzero(a[j:k + 1] >= 0.5 * lp)[0]
+    pol = int(np.sign(seg[j + big[0]]) or 1) if len(big) else int(sgn)
+    # 10-90 % rise time
+    i10 = j + int(np.nonzero(a[j:k + 1] >= 0.1 * lp)[0][0]) if np.any(a[j:k + 1] >= 0.1 * lp) else j
+    i90 = j + int(np.nonzero(a[j:k + 1] >= 0.9 * lp)[0][0])
+    return dict(onset=t0 + (lo + onset) / fs, motion=t0 + (lo + motion) / fs,
+                peak=t0 + anchor / fs, rise=(i90 - i10) / fs, polarity=pol,
+                level=float(lp))
+
+
+def find_arrivals(m: Measurement, max_n=4, min_sep_ms=0.15, min_db=-24.0, span_ms=60.0):
+    """Distinct arrivals in a single response (e.g. two speakers playing together)."""
+    from scipy.signal import find_peaks
+    fs = m.fs
+    kp = int(round((m.peak_time - m.t0) * fs))
+    lo = max(kp - int(0.02 * fs), 0)
+    hi = min(kp + int(span_ms * 1e-3 * fs), len(m.ir))
+    env = m.env[lo:hi]
+    db = 20 * np.log10(np.maximum(env / (env.max() + 1e-30), 1e-6))
+    pk, props = find_peaks(db, height=min_db, distance=max(int(min_sep_ms * 1e-3 * fs), 1), prominence=6)
+    if not len(pk):
+        return []
+    order = np.argsort(db[pk])[::-1][:max_n]
+    pk = np.sort(pk[order])
+    out = []
+    for p in pk:
+        out.append(dict(t=m.t0 + (lo + p) / fs, db=float(db[p]),
+                        polarity=1 if m.ir[lo + p] >= 0 else -1))
+    return out
+
+# ------------------------------------------------------- spectra and smoothing
 @dataclass
 class Spectrum:
     f: np.ndarray
-    H0: np.ndarray      # réponse avec le retard propre retiré (référence = pic)
-    tp: float           # temps du pic (s)
+    H0: np.ndarray      # response with its own delay removed (reference = peak)
+    tp: float           # peak time (s)
     window: tuple = (0.0, 0.0)
 
 
@@ -343,12 +753,12 @@ def log_grid(fmin, fmax, n=1500):
 
 
 class Smoother:
-    """Moyenne par fraction d'octave sur une grille log.
+    """Fractional-octave averaging on a log grid.
 
-    Les bornes de la fenêtre sont fractionnaires (somme cumulée interpolée) :
-    le résultat est continu, sans marches, même là où la fenêtre ne couvre
-    que quelques raies FFT. Fenêtre minimale = 1 raie, ce qui équivaut à une
-    interpolation linéaire (cas « aucun lissage »).
+    The window edges are fractional (interpolated cumulative sum): the result
+    is continuous, without steps, even where the window covers only a few
+    FFT bins. Minimum window = 1 bin, which amounts to linear interpolation
+    (the "no smoothing" case).
     """
 
     def __init__(self, f, grid, frac):
@@ -381,10 +791,10 @@ class Smoother:
 
 @dataclass
 class Curve:
-    Hs: np.ndarray       # complexe lissé, retard propre retiré
-    pw: np.ndarray       # puissance lissée
+    Hs: np.ndarray       # smoothed complex, own delay removed
+    pw: np.ndarray       # smoothed power
     tp: float
-    gd: np.ndarray       # retard de groupe résiduel lissé (s)
+    gd: np.ndarray       # smoothed residual group delay (s)
 
     @property
     def mag_db(self):
@@ -398,8 +808,8 @@ def make_curve(spec: Spectrum, sm: Smoother) -> Curve:
     H = spec.H0
     P = np.abs(H) ** 2
     pw = np.maximum(sm(P), 1e-30)
-    # Retard de groupe raie par raie (différence de phase entre raies voisines),
-    # puis moyenne pondérée par l'énergie : robuste, sans dérivée numérique bruitée.
+    # Group delay bin by bin (phase difference between neighboring bins),
+    # then energy-weighted average: robust, without a noisy numerical derivative.
     df = spec.f[1] - spec.f[0]
     d = -np.angle(H[1:] * np.conj(H[:-1])) / (2 * np.pi * df)
     gd_lin = np.concatenate(([d[0]], 0.5 * (d[1:] + d[:-1]), [d[-1]]))
@@ -416,26 +826,26 @@ def group_delay_ms(curve: Curve, grid, extra_s=0.0):
     return (curve.gd + extra_s) * 1e3
 
 
-# ----------------------------------------------------------------- comparaison
+# ----------------------------------------------------------------- comparison
 @dataclass
 class Comparison:
     dmag: np.ndarray          # dB
-    dres: np.ndarray          # ° déroulé, retard dtp retiré
-    dtp: float                # écart des pics (s)
-    delta: float              # correction fine (s)
-    tau: float                # retard total estimé (s) : mesure en retard si > 0
-    theta: float              # rotation totale (°), polarité incluse
+    dres: np.ndarray          # ° unwrapped, delay dtp removed
+    dtp: float                # peak time difference (s)
+    delta: float              # fine correction (s)
+    tau: float                # total estimated delay (s): measurement is late if > 0
+    theta: float              # total rotation (°), polarity included
     inverted: bool
-    rotation: float           # rotation restante après polarité (°)
+    rotation: float           # remaining rotation after polarity (°)
     gain_db: float
-    resid_rms: float          # ° RMS dans la bande après correction
+    resid_rms: float          # ° RMS in the band after correction
     notch_hz: float | None
     sum_before: np.ndarray | None = None
     sum_after: np.ndarray | None = None
     sum_ideal: np.ndarray | None = None
 
     def dphase(self, grid, mode):
-        """mode 'indiv' : retard estimé retiré ; sinon retard inclus."""
+        """mode 'indiv': estimated delay removed; otherwise delay included."""
         if mode == "indiv":
             return self.dres + 360 * grid * self.delta
         return self.dres - 360 * grid * self.dtp
@@ -447,7 +857,7 @@ def compare(si: Spectrum, sref: Spectrum, ci: Curve, cref: Curve, sm: Smoother,
     dtp = si.tp - sref.tp
     C = si.H0 * np.conj(sref.H0)
 
-    # --- retard + rotation conjoints (GCC pondéré 1/f, enveloppe analytique)
+    # --- joint delay + rotation (1/f-weighted GCC, analytic envelope)
     mag = np.abs(C)
     band = (f >= flo) & (f <= fhi)
     if band.sum() < 4:
@@ -477,7 +887,7 @@ def compare(si: Spectrum, sref: Spectrum, ci: Curve, cref: Curve, sm: Smoother,
     inverted = abs(theta) > 90
     rotation = float(wrap_deg(theta - 180)) if inverted else theta
 
-    # --- courbes de différence (spectre croisé lissé / puissance de référence)
+    # --- difference curves (smoothed cross-spectrum / reference power)
     Cs = sm(C)
     D0 = Cs / cref.pw
     dres = np.degrees(np.unwrap(np.angle(D0)))
@@ -514,25 +924,29 @@ def compare(si: Spectrum, sref: Spectrum, ci: Curve, cref: Curve, sm: Smoother,
     return out
 
 
-# ------------------------------------------------- comparaison temporelle
-def original_vs_take(m: Measurement, mode="aligned"):
-    """Renvoie (prédiction, résidu, gain, résidu_dB).
 
-    aligned : l'original décalé du retard mesuré et mis à l'échelle.
-    model   : l'original filtré par la réponse mesurée complète ; le résidu
-              ne contient alors que bruit + distorsion.
+
+# ------------------------------------------------- time-domain comparison
+def original_vs_take(m: Measurement, mode="aligned"):
+    """Returns (prediction, residual, gain, residual_dB).
+
+    aligned: the original (or the loopback) shifted by the measured delay and scaled.
+    model  : the original filtered by the complete measured response; the residual
+              then only contains noise + distortion.
     """
     y, x, fs = m.y, m.xref, m.fs
     if mode == "model":
-        nneg = int(round(-m.t0 * fs))
-        pred = fftconvolve(x, m.ir)[nneg:nneg + len(y)]
+        full = fftconvolve(x, m.ir_raw)
+        shift = int(round(m.t0_raw * fs))
+        if shift < 0:
+            pred = full[-shift:-shift + len(y)]
+        else:
+            pred = np.concatenate([np.zeros(shift), full])[:len(y)]
         if len(pred) < len(y):
             pred = np.pad(pred, (0, len(y) - len(pred)))
         g = 1.0
     else:
-        N = next_pow2(len(y) + len(x))
-        f = np.fft.rfftfreq(N, 1 / fs)
-        xs = np.fft.irfft(np.fft.rfft(x, N) * np.exp(-2j * np.pi * f * m.peak_time), N)[:len(y)]
+        xs = frac_shift(x, m.peak_raw, fs, len(y))
         den = float(xs @ xs)
         g = float(y @ xs) / den if den > 0 else 0.0
         pred = g * xs

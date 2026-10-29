@@ -1,4 +1,4 @@
-"""Thème sombre, minimal, angles quasi droits."""
+"""Dark, minimal theme with near-square corners."""
 
 C = dict(
     bg="#0c0e11",
@@ -43,6 +43,10 @@ QPushButton:disabled {{ color: {C['faint']}; border-color: {C['border']}; }}
 QPushButton#Primary {{ background: {C['accent']}; color: #06120f; border: 1px solid {C['accent']};
                       font-weight: 600; }}
 QPushButton#Primary:hover {{ background: #4fd8c2; }}
+QFrame#Sidebar QPushButton#Primary, QPushButton#Primary {{ background: {C['accent']}; color: #06120f;
+    border: 1px solid {C['accent']}; font-weight: 600; }}
+QFrame#Sidebar QPushButton#Primary:hover {{ background: #4fd8c2; }}
+QPushButton#Primary:disabled {{ background: {C['accent_dim']}; color: {C['muted']}; border-color: {C['accent_dim']}; }}
 QPushButton#Flat {{ background: transparent; border: none; color: {C['muted']}; padding: 4px 6px; }}
 QPushButton#Flat:hover {{ color: {C['text']}; }}
 
